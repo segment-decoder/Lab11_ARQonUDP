@@ -17,24 +17,118 @@
 CCriticalSection tx_cs; // 송신 리스트 접근을 보호하는 임계 영역입니다.
 CCriticalSection rx_cs; // 수신 리스트 접근을 보호하는 임계 영역입니다.
 
+BOOL g_isTrimmingInput = FALSE; // 입력창을 코드로 수정할 때 EN_CHANGE가 재진입하지 않도록 막습니다.
+
+void AppendEditText(CEdit& edit, const CString& text) // 지정한 Edit Control의 끝에 로그 문자열을 추가합니다.
+{
+	int len = edit.GetWindowTextLengthW(); // 기존 출력 문자열의 끝 위치를 구합니다.
+	edit.SetSel(len, len); // 새 로그가 끝에 붙도록 커서를 이동합니다.
+	edit.ReplaceSel(text); // 전달받은 로그 문자열을 화면에 추가합니다.
+}
+
+int GetUtf8ByteCount(const CStringW& text) // CStringW가 UTF-8로 바뀔 때 필요한 Byte 수를 계산합니다.
+{
+	if (text.IsEmpty()) // 빈 문자열은 전송할 Byte가 없습니다.
+		return 0;
+
+	return WideCharToMultiByte(CP_UTF8, 0, text, text.GetLength(), NULL, 0, NULL, NULL); // UTF-8 변환 결과의 Byte 수를 반환합니다.
+}
+
+BOOL LimitTextToPayloadSize(const CString& source, CString& limitedText) // 입력 문자열을 Frame Payload 16Byte 안에 들어가도록 자릅니다.
+{
+	CStringW sourceText(source); // Unicode CString을 UTF-8 Byte 계산용 문자열로 변환합니다.
+	CStringW limitedWideText; // 16Byte 안에 들어가는 문자만 누적합니다.
+	int usedBytes = 0; // 현재까지 누적된 UTF-8 Byte 수입니다.
+	int index = 0; // UTF-16 문자 위치를 추적합니다.
+
+	while (index < sourceText.GetLength()) // 입력 문자열을 앞에서부터 문자 단위로 검사합니다.
+	{
+		int unitCount = 1; // 기본적으로 UTF-16 코드 유닛 하나를 문자 단위로 봅니다.
+		WCHAR currentChar = sourceText[index]; // 현재 검사 중인 UTF-16 코드 유닛입니다.
+
+		if (currentChar >= 0xD800 && currentChar <= 0xDBFF && index + 1 < sourceText.GetLength()) // 서로게이트 쌍의 앞부분인지 확인합니다.
+		{
+			WCHAR nextChar = sourceText[index + 1]; // 서로게이트 쌍의 뒷부분 후보를 가져옵니다.
+			if (nextChar >= 0xDC00 && nextChar <= 0xDFFF) // 올바른 서로게이트 쌍이면 두 코드 유닛을 같이 처리합니다.
+				unitCount = 2;
+		}
+
+		CStringW unitText = sourceText.Mid(index, unitCount); // 현재 문자 단위를 UTF-8 Byte 계산 대상으로 잘라냅니다.
+		int unitBytes = WideCharToMultiByte(CP_UTF8, 0, unitText, unitCount, NULL, 0, NULL, NULL); // 현재 문자 단위의 UTF-8 Byte 수를 계산합니다.
+		if (usedBytes + unitBytes > FRAME_PAYLOAD_SIZE) // 16Byte를 넘으면 더 이상 입력을 받지 않습니다.
+			break;
+
+		limitedWideText += unitText; // 제한 안에 들어가는 문자를 결과 문자열에 추가합니다.
+		usedBytes += unitBytes; // 누적 Byte 수를 갱신합니다.
+		index += unitCount; // 다음 문자 단위로 이동합니다.
+	}
+
+	limitedText = CString(limitedWideText); // 제한된 Unicode 문자열을 MFC CString으로 되돌립니다.
+	return sourceText.GetLength() != limitedWideText.GetLength(); // 실제로 잘라낸 문자가 있는지 반환합니다.
+}
+
+BOOL BuildFrameFromText(const CString& text, Frame& frame) // 입력 문자열을 16Byte Payload를 가진 Frame 패킷으로 변환합니다.
+{
+	CStringW wideText(text); // UI 입력 문자열을 UTF-8 변환용 Unicode 문자열로 준비합니다.
+	int utf8Bytes = GetUtf8ByteCount(wideText); // 전송 Payload에 들어갈 실제 Byte 수를 계산합니다.
+
+	if (utf8Bytes <= 0) // 빈 메시지는 Frame으로 만들지 않습니다.
+		return FALSE;
+
+	if (utf8Bytes > FRAME_PAYLOAD_SIZE) // UI 제한을 우회한 16Byte 초과 입력은 송신하지 않습니다.
+		return FALSE;
+
+	frame = Frame(); // 기존 Frame 내용을 초기화합니다.
+	frame.payload_len = utf8Bytes; // 수신자가 실제 Payload 길이를 알 수 있도록 Header 값을 채웁니다.
+	WideCharToMultiByte(CP_UTF8, 0, wideText, wideText.GetLength(), (LPSTR)frame.payload, FRAME_PAYLOAD_SIZE, NULL, NULL); // 입력 문자열을 UTF-8 Byte로 Payload에 저장합니다.
+	return TRUE; // Frame 생성 성공을 알립니다.
+}
+
+CString FramePayloadToText(const Frame& frame) // 수신한 Frame Payload를 화면 출력용 CString으로 복원합니다.
+{
+	if (frame.payload_len <= 0 || frame.payload_len > FRAME_PAYLOAD_SIZE) // Payload 길이가 올바르지 않으면 빈 문자열을 반환합니다.
+		return _T("");
+
+	int wideChars = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)frame.payload, frame.payload_len, NULL, 0); // UTF-8 Payload를 Unicode로 바꿀 때 필요한 문자 수를 계산합니다.
+	if (wideChars <= 0) // UTF-8 변환에 실패하면 빈 문자열을 반환합니다.
+		return _T("");
+
+	CStringW wideText; // 복원된 Unicode 문자열을 저장합니다.
+	LPWSTR buffer = wideText.GetBuffer(wideChars); // MultiByteToWideChar가 쓸 문자열 버퍼를 확보합니다.
+	MultiByteToWideChar(CP_UTF8, 0, (LPCCH)frame.payload, frame.payload_len, buffer, wideChars); // Payload Byte를 Unicode 문자열로 복원합니다.
+	wideText.ReleaseBuffer(wideChars); // CStringW 버퍼 길이를 실제 복원 길이로 확정합니다.
+	return CString(wideText); // MFC 화면 출력용 CString으로 반환합니다.
+}
+
+void AppendPacketLog(CEdit& edit, LPCTSTR action, const Frame& frame, int packetBytes) // Frame 송수신 결과를 검증 가능한 로그로 출력합니다.
+{
+	CString payloadText = FramePayloadToText(frame); // 로그에 보여줄 Payload 문자열을 복원합니다.
+	CString log; // 화면에 출력할 패킷 로그 문자열입니다.
+	log.Format(_T("[%s PACKET] packet_bytes=%d seq=%d ack=%d checksum=%d payload_len=%d payload=\"%s\"\r\n"), action, packetBytes, frame.seq_num, frame.ack_num, frame.checksum, frame.payload_len, payloadText.GetString()); // Header 값과 Payload 정보를 포함한 로그를 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 패킷 로그를 추가합니다.
+}
+
 UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하는 스레드 함수입니다.
 {
 	ThreadArg* pArg = (ThreadArg*)arg; // 스레드 인자를 ThreadArg 형식으로 변환합니다.
-	CStringList* plist = pArg->pList; // 송신 메시지 리스트 주소를 가져옵니다.
+	CList<Frame, Frame&>* plist = pArg->pList; // 송신 Frame 패킷 리스트 주소를 가져옵니다.
 	CUDPClientThdDlg* pDlg = (CUDPClientThdDlg*)pArg->pDlg; // 대화상자 주소를 가져옵니다.
 
 	while (pArg->Thread_run) // 스레드 실행 플래그가 켜져 있는 동안 반복합니다.
 	{
-		POSITION pos = plist->GetHeadPosition(); // 송신 리스트의 첫 위치를 가져옵니다.
-		POSITION current_pos; // 삭제할 현재 위치를 저장합니다.
+		Frame frame; // 송신 리스트에서 꺼낸 Frame 패킷을 저장합니다.
+		BOOL hasFrame = FALSE; // 이번 반복에서 송신할 Frame이 있는지 표시합니다.
 
-		while (pos != NULL) // 송신 리스트에 메시지가 있으면 처리합니다.
+		tx_cs.Lock(); // 송신 리스트 접근을 잠급니다.
+		if (!plist->IsEmpty()) // 송신할 Frame이 있으면 하나 꺼냅니다.
 		{
-			current_pos = pos; // 현재 리스트 위치를 저장합니다.
-			tx_cs.Lock(); // 송신 리스트 접근을 잠급니다.
-			CString str = plist->GetNext(pos); // 송신할 문자열을 꺼냅니다.
-			tx_cs.Unlock(); // 송신 리스트 접근 잠금을 풉니다.
+			frame = plist->RemoveHead(); // 송신할 Frame을 리스트에서 제거하며 가져옵니다.
+			hasFrame = TRUE; // 송신할 Frame이 있음을 표시합니다.
+		}
+		tx_cs.Unlock(); // 송신 리스트 잠금을 풉니다.
 
+		if (hasFrame) // 송신할 Frame이 있을 때만 UDP 전송을 시도합니다.
+		{
 			if (pDlg->m_hSocket != INVALID_SOCKET) // UDP 소켓이 있을 때만 전송합니다.
 			{
 				BYTE nField0, nField1, nField2, nField3; // IP Address 컨트롤의 각 주소 값을 저장합니다.
@@ -46,15 +140,12 @@ UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하�
 				server_addr.sin_family = AF_INET; // IPv4 주소 체계를 사용합니다.
 				server_addr.sin_port = htons(8000); // 서버 포트 번호를 8000번으로 설정합니다.
 				InetPton(AF_INET, addr, &server_addr.sin_addr); // 서버 IP 주소를 저장합니다.
-				sendto(pDlg->m_hSocket, (char*)(LPCTSTR)str, (str.GetLength() + 1) * sizeof(TCHAR), 0, (SOCKADDR*)&server_addr, sizeof(server_addr)); // 서버 8000번 포트로 UDP 메시지를 보냅니다.
-				int len = pDlg->m_tx_edit.GetWindowTextLengthW(); // 송신 출력창의 끝 위치를 구합니다.
-				pDlg->m_tx_edit.SetSel(len, len); // 송신 출력창 커서를 끝으로 이동합니다.
-				pDlg->m_tx_edit.ReplaceSel(str); // 보낸 메시지를 송신 출력창에 출력합니다.
+				int sentBytes = sendto(pDlg->m_hSocket, (char*)&frame, sizeof(Frame), 0, (SOCKADDR*)&server_addr, sizeof(server_addr)); // Frame 구조체 전체를 UDP 패킷으로 보냅니다.
+				if (sentBytes != SOCKET_ERROR) // 전송이 성공하면 패킷 로그를 남깁니다.
+					AppendPacketLog(pDlg->m_packet_log_edit, _T("SEND"), frame, sentBytes);
+				else // sendto 호출이 실패하면 전송 실패 로그를 남깁니다.
+					AppendEditText(pDlg->m_packet_log_edit, _T("[SEND FAIL] sendto failed\r\n"));
 			}
-
-			tx_cs.Lock(); // 송신 리스트 삭제를 위해 잠급니다.
-			plist->RemoveAt(current_pos); // 전송한 메시지를 리스트에서 삭제합니다.
-			tx_cs.Unlock(); // 송신 리스트 잠금을 풉니다.
 		}
 
 		Sleep(10); // CPU 사용을 줄이기 위해 잠시 대기합니다.
@@ -66,29 +157,33 @@ UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하�
 UINT RXThread(LPVOID arg) // UDP로 받은 메시지를 화면에 출력하는 스레드 함수입니다.
 {
 	ThreadArg* pArg = (ThreadArg*)arg; // 스레드 인자를 ThreadArg 형식으로 변환합니다.
-	CStringList* plist = pArg->pList; // 수신 메시지 리스트 주소를 가져옵니다.
+	CList<Frame, Frame&>* plist = pArg->pList; // 수신 Frame 패킷 리스트 주소를 가져옵니다.
 	CUDPClientThdDlg* pDlg = (CUDPClientThdDlg*)pArg->pDlg; // 대화상자 주소를 가져옵니다.
 
 	while (pArg->Thread_run) // 스레드 실행 플래그가 켜져 있는 동안 반복합니다.
 	{
 		pDlg->ProcessReceive(); // UDP 메시지를 수신하여 리스트에 저장합니다.
-		POSITION pos = plist->GetHeadPosition(); // 수신 리스트의 첫 위치를 가져옵니다.
-		POSITION current_pos; // 삭제할 현재 위치를 저장합니다.
 
-		while (pos != NULL) // 수신 리스트에 메시지가 있으면 처리합니다.
+		while (TRUE) // 수신 리스트에 쌓인 Frame을 모두 출력합니다.
 		{
-			current_pos = pos; // 현재 리스트 위치를 저장합니다.
+			Frame frame; // 수신 리스트에서 꺼낸 Frame 패킷을 저장합니다.
+			BOOL hasFrame = FALSE; // 이번 반복에서 출력할 Frame이 있는지 표시합니다.
+
 			rx_cs.Lock(); // 수신 리스트 접근을 잠급니다.
-			CString str = plist->GetNext(pos); // 출력할 문자열을 꺼냅니다.
-			rx_cs.Unlock(); // 수신 리스트 접근 잠금을 풉니다.
-
-			int len = pDlg->m_rx_edit.GetWindowTextLengthW(); // 수신 출력창의 끝 위치를 구합니다.
-			pDlg->m_rx_edit.SetSel(len, len); // 수신 출력창 커서를 끝으로 이동합니다.
-			pDlg->m_rx_edit.ReplaceSel(str); // 받은 메시지를 수신 출력창에 출력합니다.
-
-			rx_cs.Lock(); // 수신 리스트 삭제를 위해 잠급니다.
-			plist->RemoveAt(current_pos); // 출력한 메시지를 리스트에서 삭제합니다.
+			if (!plist->IsEmpty()) // 출력할 Frame이 있으면 하나 꺼냅니다.
+			{
+				frame = plist->RemoveHead(); // 출력할 Frame을 리스트에서 제거하며 가져옵니다.
+				hasFrame = TRUE; // 출력할 Frame이 있음을 표시합니다.
+			}
 			rx_cs.Unlock(); // 수신 리스트 잠금을 풉니다.
+
+			if (!hasFrame) // 더 이상 출력할 Frame이 없으면 반복을 끝냅니다.
+				break;
+
+			CString payloadText = FramePayloadToText(frame); // 수신한 Payload를 채팅창 출력 문자열로 복원합니다.
+			payloadText += _T("\r\n"); // 채팅창에서 메시지 단위를 구분하기 위해 줄바꿈을 추가합니다.
+			AppendEditText(pDlg->m_rx_edit, payloadText); // 복원된 채팅 메시지를 수신창에 출력합니다.
+			AppendPacketLog(pDlg->m_packet_log_edit, _T("RECV"), frame, sizeof(Frame)); // 받은 Frame 정보를 패킷 로그창에 출력합니다.
 		}
 
 		Sleep(10); // CPU 사용을 줄이기 위해 잠시 대기합니다.
@@ -149,6 +244,7 @@ void CUDPClientThdDlg::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_EDIT1, m_tx_edit_short); // 보낼 메시지 입력 컨트롤을 연결합니다.
 	DDX_Control(pDX, IDC_EDIT2, m_rx_edit); // 받은 메시지 출력 컨트롤을 연결합니다.
 	DDX_Control(pDX, IDC_EDIT3, m_tx_edit); // 보낸 메시지 출력 컨트롤을 연결합니다.
+	DDX_Control(pDX, IDC_PACKET_LOG, m_packet_log_edit); // 패킷 송수신 과정을 표시할 로그 컨트롤을 연결합니다.
 }
 
 BEGIN_MESSAGE_MAP(CUDPClientThdDlg, CDialogEx)
@@ -157,6 +253,7 @@ BEGIN_MESSAGE_MAP(CUDPClientThdDlg, CDialogEx)
 	ON_WM_QUERYDRAGICON()
 	ON_BN_CLICKED(IDC_SEND, &CUDPClientThdDlg::OnBnClickedSend)
 	ON_BN_CLICKED(IDC_CLOSE, &CUDPClientThdDlg::OnBnClickedClose)
+	ON_EN_CHANGE(IDC_EDIT1, &CUDPClientThdDlg::OnEnChangeEdit1)
 END_MESSAGE_MAP()
 
 
@@ -191,12 +288,14 @@ BOOL CUDPClientThdDlg::OnInitDialog()
 	SetIcon(m_hIcon, TRUE);			// 큰 아이콘을 설정합니다.
 	SetIcon(m_hIcon, FALSE);		// 작은 아이콘을 설정합니다.
 
-	CStringList* newlist = new CStringList; // 송신 메시지를 저장할 리스트를 생성합니다.
+	m_tx_edit_short.SetLimitText(FRAME_PAYLOAD_SIZE); // 영문 기준 16자 이상 입력되지 않도록 기본 제한을 설정합니다.
+
+	CList<Frame, Frame&>* newlist = new CList<Frame, Frame&>; // 송신 Frame 패킷을 저장할 리스트를 생성합니다.
 	arg1.pList = newlist; // 송신 스레드 인자에 송신 리스트를 저장합니다.
 	arg1.Thread_run = 1; // 송신 스레드 실행 플래그를 켭니다.
 	arg1.pDlg = this; // 송신 스레드 인자에 대화상자 주소를 저장합니다.
 
-	CStringList* newlist2 = new CStringList; // 수신 메시지를 저장할 리스트를 생성합니다.
+	CList<Frame, Frame&>* newlist2 = new CList<Frame, Frame&>; // 수신 Frame 패킷을 저장할 리스트를 생성합니다.
 	arg2.pList = newlist2; // 수신 스레드 인자에 수신 리스트를 저장합니다.
 	arg2.Thread_run = 1; // 수신 스레드 실행 플래그를 켭니다.
 	arg2.pDlg = this; // 수신 스레드 인자에 대화상자 주소를 저장합니다.
@@ -268,8 +367,7 @@ HCURSOR CUDPClientThdDlg::OnQueryDragIcon()
 
 void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스트에 넣습니다.
 {
-	TCHAR pBuf[1024 + 1]; // 받은 UDP 데이터를 저장할 버퍼입니다.
-	CString strData; // 화면에 출력할 수신 문자열입니다.
+	Frame frame; // UDP에서 받은 패킷을 저장할 Frame 구조체입니다.
 	int nbytes; // 실제로 받은 바이트 수입니다.
 
 	if (m_hSocket == INVALID_SOCKET) // 소켓이 없으면 수신하지 않습니다.
@@ -277,31 +375,69 @@ void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스
 
 	SOCKADDR_IN peer_addr; // 보낸 쪽 주소를 저장하는 구조체입니다.
 	int peer_len = sizeof(peer_addr); // 보낸 쪽 주소 구조체 크기입니다.
-	nbytes = recvfrom(m_hSocket, (char*)pBuf, 1024 * sizeof(TCHAR), 0, (SOCKADDR*)&peer_addr, &peer_len); // UDP 메시지와 보낸 쪽 주소를 받습니다.
+	nbytes = recvfrom(m_hSocket, (char*)&frame, sizeof(Frame), 0, (SOCKADDR*)&peer_addr, &peer_len); // UDP 메시지를 Frame 구조체 크기만큼 받습니다.
 
 	if (nbytes <= 0) // 받은 데이터가 없으면 함수를 끝냅니다.
 		return;
 
-	pBuf[nbytes / sizeof(TCHAR)] = NULL; // 문자열 끝을 표시합니다.
-	strData = (LPCTSTR)pBuf; // 받은 버퍼를 CString으로 변환합니다.
+	if (nbytes != sizeof(Frame)) // Frame 크기와 다르면 패킷으로 인정하지 않습니다.
+	{
+		AppendEditText(m_packet_log_edit, _T("[RECV DROP] invalid packet size\r\n")); // 잘못된 크기의 패킷을 로그에 남깁니다.
+		return;
+	}
+
+	if (frame.payload_len <= 0 || frame.payload_len > FRAME_PAYLOAD_SIZE) // Payload 길이가 범위를 벗어나면 버립니다.
+	{
+		AppendEditText(m_packet_log_edit, _T("[RECV DROP] invalid payload length\r\n")); // 잘못된 Payload 길이를 로그에 남깁니다.
+		return;
+	}
 
 	rx_cs.Lock(); // 수신 리스트 접근을 잠급니다.
-	arg2.pList->AddTail((LPCTSTR)strData); // 받은 메시지를 수신 리스트에 추가합니다.
+	arg2.pList->AddTail(frame); // 받은 Frame 패킷을 수신 리스트에 추가합니다.
 	rx_cs.Unlock(); // 수신 리스트 접근 잠금을 풉니다.
 }
 
 void CUDPClientThdDlg::OnBnClickedSend() // Send 버튼 클릭 시 메시지를 송신 리스트에 넣습니다.
 {
 	CString tx_message; // 사용자가 입력한 송신 메시지입니다.
+	Frame frame; // 입력 메시지를 담을 Frame 패킷입니다.
 	m_tx_edit_short.GetWindowTextW(tx_message); // 입력창의 문자열을 가져옵니다.
-	tx_message += _T("\r\n"); // 출력과 전송을 위해 줄바꿈을 추가합니다.
+
+	if (!BuildFrameFromText(tx_message, frame)) // 입력 문자열이 Frame Payload 제한에 맞는지 확인합니다.
+	{
+		AppendEditText(m_packet_log_edit, _T("[SEND SKIP] payload must be 1-16 bytes\r\n")); // 전송하지 않은 이유를 패킷 로그에 남깁니다.
+		m_tx_edit_short.SetFocus(); // 사용자가 바로 다시 입력할 수 있도록 포커스를 돌립니다.
+		return;
+	}
+
+	CString tx_log = tx_message + _T("\r\n"); // 송신 채팅창에 표시할 문자열에 줄바꿈을 추가합니다.
+	AppendEditText(m_tx_edit, tx_log); // 사용자가 보낸 원문 메시지를 송신창에 출력합니다.
+	AppendPacketLog(m_packet_log_edit, _T("CREATE"), frame, sizeof(Frame)); // 생성된 Frame 정보를 패킷 로그창에 출력합니다.
 
 	tx_cs.Lock(); // 송신 리스트 접근을 잠급니다.
-	arg1.pList->AddTail(tx_message); // 송신할 메시지를 리스트에 추가합니다.
+	arg1.pList->AddTail(frame); // 송신할 Frame 패킷을 리스트에 추가합니다.
 	tx_cs.Unlock(); // 송신 리스트 접근 잠금을 풉니다.
 
 	m_tx_edit_short.SetWindowTextW(_T("")); // 입력창을 비웁니다.
 	m_tx_edit_short.SetFocus(); // 입력창으로 포커스를 이동합니다.
+}
+
+void CUDPClientThdDlg::OnEnChangeEdit1() // 입력창의 UTF-8 Byte 수가 16Byte를 넘지 않도록 즉시 제한합니다.
+{
+	if (g_isTrimmingInput) // 코드가 입력창을 갱신하는 중이면 재진입을 막습니다.
+		return;
+
+	CString currentText; // 현재 입력창 문자열을 저장합니다.
+	CString limitedText; // 16Byte 안에 들어가는 문자열만 저장합니다.
+	m_tx_edit_short.GetWindowTextW(currentText); // 현재 입력창 문자열을 읽습니다.
+
+	if (!LimitTextToPayloadSize(currentText, limitedText)) // 이미 16Byte 이하이면 수정하지 않습니다.
+		return;
+
+	g_isTrimmingInput = TRUE; // SetWindowTextW로 발생할 EN_CHANGE 재진입을 막습니다.
+	m_tx_edit_short.SetWindowTextW(limitedText); // 16Byte를 넘는 부분을 제거한 문자열로 입력창을 갱신합니다.
+	m_tx_edit_short.SetSel(limitedText.GetLength(), limitedText.GetLength()); // 커서를 제한된 문자열 끝으로 이동합니다.
+	g_isTrimmingInput = FALSE; // 입력 제한 작업이 끝났음을 표시합니다.
 }
 
 void CUDPClientThdDlg::OnBnClickedClose() // Close 버튼 클릭 시 소켓과 스레드를 종료합니다.
