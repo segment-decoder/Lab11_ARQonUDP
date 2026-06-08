@@ -34,6 +34,22 @@ int GetUtf8ByteCount(const CStringW& text) // CStringW가 UTF-8로 바뀔 때 �
 	return WideCharToMultiByte(CP_UTF8, 0, text, text.GetLength(), NULL, 0, NULL, NULL); // UTF-8 변환 결과의 Byte 수를 반환합니다.
 }
 
+CString Utf8BytesToText(const BYTE* payload, int payloadLen, int maxBytes) // UTF-8 Byte 배열을 화면 출력용 CString으로 복원합니다.
+{
+	if (payloadLen <= 0 || payloadLen > maxBytes) // Byte 길이가 허용 범위를 벗어나면 빈 문자열을 반환합니다.
+		return _T("");
+
+	int wideChars = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)payload, payloadLen, NULL, 0); // UTF-8 Byte를 Unicode로 바꿀 때 필요한 문자 수를 계산합니다.
+	if (wideChars <= 0) // UTF-8 변환에 실패하면 빈 문자열을 반환합니다.
+		return _T("");
+
+	CStringW wideText; // 복원된 Unicode 문자열을 저장합니다.
+	LPWSTR buffer = wideText.GetBuffer(wideChars); // MultiByteToWideChar가 쓸 문자열 버퍼를 확보합니다.
+	MultiByteToWideChar(CP_UTF8, 0, (LPCCH)payload, payloadLen, buffer, wideChars); // Payload Byte를 Unicode 문자열로 복원합니다.
+	wideText.ReleaseBuffer(wideChars); // CStringW 버퍼 길이를 실제 복원 길이로 확정합니다.
+	return CString(wideText); // MFC 화면 출력용 CString으로 반환합니다.
+}
+
 BOOL LimitTextToMessageSize(const CString& source, CString& limitedText) // 입력 문자열을 전체 메시지 제한 256Byte 안에 들어가도록 자릅니다.
 {
 	CStringW sourceText(source); // Unicode CString을 UTF-8 Byte 계산용 문자열로 변환합니다.
@@ -139,15 +155,7 @@ CString FramePayloadToText(const Frame& frame) // 수신한 Frame Payload를 화
 	if (frame.payload_len <= 0 || frame.payload_len > FRAME_PAYLOAD_SIZE) // Payload 길이가 올바르지 않으면 빈 문자열을 반환합니다.
 		return _T("");
 
-	int wideChars = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)frame.payload, frame.payload_len, NULL, 0); // UTF-8 Payload를 Unicode로 바꿀 때 필요한 문자 수를 계산합니다.
-	if (wideChars <= 0) // UTF-8 변환에 실패하면 빈 문자열을 반환합니다.
-		return _T("");
-
-	CStringW wideText; // 복원된 Unicode 문자열을 저장합니다.
-	LPWSTR buffer = wideText.GetBuffer(wideChars); // MultiByteToWideChar가 쓸 문자열 버퍼를 확보합니다.
-	MultiByteToWideChar(CP_UTF8, 0, (LPCCH)frame.payload, frame.payload_len, buffer, wideChars); // Payload Byte를 Unicode 문자열로 복원합니다.
-	wideText.ReleaseBuffer(wideChars); // CStringW 버퍼 길이를 실제 복원 길이로 확정합니다.
-	return CString(wideText); // MFC 화면 출력용 CString으로 반환합니다.
+	return Utf8BytesToText(frame.payload, frame.payload_len, FRAME_PAYLOAD_SIZE); // Frame 하나의 Payload Byte를 CString으로 복원합니다.
 }
 
 void AppendPacketLog(CEdit& edit, LPCTSTR action, const Frame& frame, int packetBytes) // Frame 송수신 결과를 검증 가능한 로그로 출력합니다.
@@ -173,6 +181,9 @@ BOOL IsValidSegmentHeader(const Frame& frame) // 수신한 Frame의 세그먼트
 	if (frame.frag_count <= 0) // 전체 조각 수는 1 이상이어야 합니다.
 		return FALSE;
 
+	if (frame.frag_count > MAX_SEGMENT_COUNT) // 전체 조각 수는 256Byte 메시지가 만들 수 있는 최대 조각 수를 넘을 수 없습니다.
+		return FALSE;
+
 	if (frame.frag_index < 0) // 조각 번호는 음수가 될 수 없습니다.
 		return FALSE;
 
@@ -180,6 +191,129 @@ BOOL IsValidSegmentHeader(const Frame& frame) // 수신한 Frame의 세그먼트
 		return FALSE;
 
 	return TRUE; // 세그먼트 Header 값이 모두 정상임을 알립니다.
+}
+
+POSITION FindReassemblyMessage(CList<ReassemblyMessage, ReassemblyMessage&>& reassemblyList, int messageId) // 메시지 번호에 해당하는 재조립 버퍼 위치를 찾습니다.
+{
+	POSITION pos = reassemblyList.GetHeadPosition(); // 재조립 리스트의 첫 위치를 가져옵니다.
+	while (pos != NULL) // 모든 재조립 버퍼를 앞에서부터 검사합니다.
+	{
+		POSITION currentPos = pos; // 현재 버퍼 위치를 반환할 수 있도록 따로 저장합니다.
+		ReassemblyMessage& message = reassemblyList.GetNext(pos); // 현재 재조립 버퍼를 가져옵니다.
+		if (message.msg_id == messageId) // 찾는 메시지 번호와 같으면 현재 위치를 반환합니다.
+			return currentPos;
+	}
+
+	return NULL; // 같은 메시지 번호를 가진 재조립 버퍼가 없음을 알립니다.
+}
+
+void AppendReassemblyDropLog(CEdit& edit, int messageId, LPCTSTR reason) // 재조립할 수 없는 조각이나 미완성 메시지 폐기 사유를 로그로 출력합니다.
+{
+	CString log; // 화면에 출력할 재조립 폐기 로그 문자열입니다.
+	log.Format(_T("[REASSEMBLY DROP] msg=%d reason=%s\r\n"), messageId, reason); // 메시지 번호와 폐기 사유를 포함한 로그를 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 재조립 폐기 로그를 추가합니다.
+}
+
+void CleanupExpiredReassemblyMessages(CList<ReassemblyMessage, ReassemblyMessage&>& reassemblyList, CEdit& edit) // 오래된 미완성 재조립 메시지를 정리합니다.
+{
+	DWORD nowTick = GetTickCount(); // 현재 시간을 밀리초 단위로 가져옵니다.
+	POSITION pos = reassemblyList.GetHeadPosition(); // 재조립 리스트의 첫 위치를 가져옵니다.
+
+	while (pos != NULL) // 재조립 중인 모든 메시지를 검사합니다.
+	{
+		POSITION removePos = pos; // 삭제할 수 있도록 현재 위치를 따로 저장합니다.
+		ReassemblyMessage& message = reassemblyList.GetNext(pos); // 현재 재조립 버퍼를 가져옵니다.
+		if (nowTick - message.last_update_tick > REASSEMBLY_TIMEOUT_MS) // 마지막 조각 수신 후 정리 시간이 지났는지 확인합니다.
+		{
+			AppendReassemblyDropLog(edit, message.msg_id, _T("incomplete timeout")); // 미완성 메시지가 시간 초과로 정리됨을 로그에 남깁니다.
+			reassemblyList.RemoveAt(removePos); // 오래된 재조립 버퍼를 리스트에서 제거합니다.
+		}
+	}
+}
+
+BOOL BuildReassembledText(const ReassemblyMessage& message, CString& completedText) // 모든 조각의 Payload를 순서대로 합쳐 원본 문자열로 복원합니다.
+{
+	BYTE payload[MAX_MESSAGE_BYTES]; // 재조립된 UTF-8 Byte를 담을 임시 버퍼입니다.
+	int offset = 0; // 임시 버퍼에 다음 Payload를 붙일 위치입니다.
+
+	memset(payload, 0, sizeof(payload)); // 재조립 임시 버퍼를 0으로 초기화합니다.
+	completedText.Empty(); // 이전 결과 문자열이 남지 않도록 비웁니다.
+
+	for (int index = 0; index < message.frag_count; index++) // 조각 번호 순서대로 모든 Payload를 이어 붙입니다.
+	{
+		if (!message.received[index]) // 중간에 빠진 조각이 있으면 재조립을 실패 처리합니다.
+			return FALSE;
+
+		const Frame& frame = message.fragments[index]; // 현재 순서의 Frame 조각을 가져옵니다.
+		if (offset + frame.payload_len > MAX_MESSAGE_BYTES) // 재조립 결과가 전체 메시지 제한을 넘으면 실패 처리합니다.
+			return FALSE;
+
+		memcpy(payload + offset, frame.payload, frame.payload_len); // 현재 조각의 Payload를 재조립 버퍼 뒤에 붙입니다.
+		offset += frame.payload_len; // 다음 조각을 붙일 위치를 갱신합니다.
+	}
+
+	completedText = Utf8BytesToText(payload, offset, MAX_MESSAGE_BYTES); // 재조립된 UTF-8 Byte를 화면 출력용 문자열로 복원합니다.
+	return !completedText.IsEmpty(); // 복원된 문자열이 있으면 재조립 성공으로 판단합니다.
+}
+
+BOOL ProcessReassemblyFrame(CList<ReassemblyMessage, ReassemblyMessage&>& reassemblyList, CEdit& edit, const Frame& frame, CString& completedText) // 수신 Frame 조각을 저장하고 완성되면 원본 메시지를 반환합니다.
+{
+	CleanupExpiredReassemblyMessages(reassemblyList, edit); // 새 조각을 처리하기 전에 오래된 미완성 메시지를 정리합니다.
+	completedText.Empty(); // 호출자에게 넘길 재조립 완료 문자열을 비웁니다.
+
+	POSITION messagePos = FindReassemblyMessage(reassemblyList, frame.msg_id); // 같은 메시지 번호로 재조립 중인 버퍼가 있는지 찾습니다.
+	if (messagePos == NULL) // 처음 도착한 메시지 번호이면 새 재조립 버퍼를 만듭니다.
+	{
+		ReassemblyMessage newMessage; // 새 원본 메시지를 모을 재조립 버퍼입니다.
+		newMessage.msg_id = frame.msg_id; // 수신 Frame의 메시지 번호를 저장합니다.
+		newMessage.frag_count = frame.frag_count; // 수신 Frame의 전체 조각 수를 저장합니다.
+		newMessage.last_update_tick = GetTickCount(); // 재조립 버퍼의 최근 갱신 시간을 기록합니다.
+		messagePos = reassemblyList.AddTail(newMessage); // 새 재조립 버퍼를 리스트 끝에 추가합니다.
+	}
+
+	ReassemblyMessage& message = reassemblyList.GetAt(messagePos); // 현재 Frame이 들어갈 재조립 버퍼를 가져옵니다.
+	if (message.frag_count != frame.frag_count) // 같은 메시지 번호에서 전체 조각 수가 달라지면 비정상 조각으로 판단합니다.
+	{
+		AppendReassemblyDropLog(edit, frame.msg_id, _T("fragment count mismatch")); // 조각 수 불일치 사유를 로그에 남깁니다.
+		return FALSE;
+	}
+
+	if (message.received[frame.frag_index]) // 이미 받은 조각 번호이면 중복 조각으로 판단합니다.
+	{
+		AppendReassemblyDropLog(edit, frame.msg_id, _T("duplicate fragment")); // 중복 조각 폐기 사유를 로그에 남깁니다.
+		return FALSE;
+	}
+
+	message.fragments[frame.frag_index] = frame; // 현재 조각을 조각 번호 위치에 저장합니다.
+	message.received[frame.frag_index] = TRUE; // 현재 조각 번호를 수신 완료로 표시합니다.
+	message.received_count++; // 현재 메시지의 수신 조각 수를 증가시킵니다.
+	message.total_payload_len += frame.payload_len; // 재조립될 전체 Payload Byte 수를 누적합니다.
+	message.last_update_tick = GetTickCount(); // 재조립 버퍼의 최근 갱신 시간을 갱신합니다.
+
+	CString storeLog; // 화면에 출력할 조각 저장 로그 문자열입니다.
+	storeLog.Format(_T("[REASSEMBLY STORE] msg=%d frag=%d/%d received=%d/%d\r\n"), frame.msg_id, frame.frag_index + 1, frame.frag_count, message.received_count, message.frag_count); // 저장된 조각과 현재 수신 현황을 로그로 만듭니다.
+	AppendEditText(edit, storeLog); // 지정한 출력창에 조각 저장 로그를 추가합니다.
+
+	if (message.received_count < message.frag_count) // 아직 모든 조각이 모이지 않았으면 대기 상태를 출력합니다.
+	{
+		CString waitLog; // 화면에 출력할 재조립 대기 로그 문자열입니다.
+		waitLog.Format(_T("[REASSEMBLY WAIT] msg=%d received=%d/%d\r\n"), message.msg_id, message.received_count, message.frag_count); // 현재까지 받은 조각 수를 로그로 만듭니다.
+		AppendEditText(edit, waitLog); // 지정한 출력창에 재조립 대기 로그를 추가합니다.
+		return FALSE;
+	}
+
+	if (!BuildReassembledText(message, completedText)) // 모든 조각을 합쳐 원본 문자열로 복원합니다.
+	{
+		AppendReassemblyDropLog(edit, frame.msg_id, _T("rebuild failed")); // 재조립 실패 사유를 로그에 남깁니다.
+		reassemblyList.RemoveAt(messagePos); // 실패한 재조립 버퍼를 제거합니다.
+		return FALSE;
+	}
+
+	CString doneLog; // 화면에 출력할 재조립 완료 로그 문자열입니다.
+	doneLog.Format(_T("[REASSEMBLY DONE] msg=%d fragments=%d bytes=%d\r\n"), message.msg_id, message.frag_count, message.total_payload_len); // 재조립 완료 정보를 로그로 만듭니다.
+	AppendEditText(edit, doneLog); // 지정한 출력창에 재조립 완료 로그를 추가합니다.
+	reassemblyList.RemoveAt(messagePos); // 완료된 재조립 버퍼를 리스트에서 제거합니다.
+	return TRUE; // 원본 메시지가 완성되었음을 호출자에게 알립니다.
 }
 
 UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하는 스레드 함수입니다.
@@ -254,11 +388,13 @@ UINT RXThread(LPVOID arg) // UDP로 받은 메시지를 화면에 출력하는 �
 			if (!hasFrame) // 더 이상 출력할 Frame이 없으면 반복을 끝냅니다.
 				break;
 
-			CString payloadText = FramePayloadToText(frame); // 수신한 Payload를 채팅창 출력 문자열로 복원합니다.
-			CString segmentText; // 수신창에 표시할 세그먼트 단위 문자열입니다.
-			segmentText.Format(_T("[msg=%d frag=%d/%d] %s\r\n"), frame.msg_id, frame.frag_index + 1, frame.frag_count, payloadText.GetString()); // 조각 번호와 Payload를 함께 표시합니다.
-			AppendEditText(pDlg->m_rx_edit, segmentText); // 복원된 세그먼트 메시지를 수신창에 출력합니다.
 			AppendPacketLog(pDlg->m_packet_log_edit, _T("RECV"), frame, sizeof(Frame)); // 받은 Frame 정보를 패킷 로그창에 출력합니다.
+			CString completedText; // 재조립이 끝난 원본 메시지 문자열입니다.
+			if (ProcessReassemblyFrame(pDlg->m_reassemblyList, pDlg->m_packet_log_edit, frame, completedText)) // 모든 조각이 모였을 때만 수신창에 원본 메시지를 출력합니다.
+			{
+				completedText += _T("\r\n"); // 채팅창에서 메시지 단위를 구분하기 위해 줄바꿈을 추가합니다.
+				AppendEditText(pDlg->m_rx_edit, completedText); // 재조립된 원본 메시지를 수신창에 출력합니다.
+			}
 		}
 
 		Sleep(10); // CPU 사용을 줄이기 위해 잠시 대기합니다.

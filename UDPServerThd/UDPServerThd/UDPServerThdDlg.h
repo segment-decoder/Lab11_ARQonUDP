@@ -8,6 +8,8 @@
 
 const int FRAME_PAYLOAD_SIZE = 16; // 과제 조건에 맞춰 Frame 하나의 데이터 필드를 16Byte로 고정합니다.
 const int MAX_MESSAGE_BYTES = 256; // 세그먼트 단계에서 한 번에 입력할 수 있는 전체 메시지 크기를 256Byte로 제한합니다.
+const int MAX_SEGMENT_COUNT = (MAX_MESSAGE_BYTES + FRAME_PAYLOAD_SIZE - 1) / FRAME_PAYLOAD_SIZE; // 256Byte 메시지가 최대 몇 개의 Frame으로 나뉘는지 계산합니다.
+const DWORD REASSEMBLY_TIMEOUT_MS = 5000; // 재전송 구현 전 단계에서 너무 오래 남은 미완성 재조립 메시지를 정리하는 시간입니다.
 
 struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 구조체입니다.
 {
@@ -30,6 +32,32 @@ struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 �
 		frag_count = 0; // 아직 조각 총수가 정해지지 않은 상태로 초기화합니다.
 		payload_len = 0; // 아직 담긴 Payload가 없음을 표시합니다.
 		memset(payload, 0, sizeof(payload)); // Payload 버퍼를 0으로 초기화합니다.
+	}
+};
+
+struct ReassemblyMessage // 수신한 여러 Frame 조각을 원본 메시지 단위로 모아두는 구조체입니다.
+{
+	int msg_id; // 재조립 중인 원본 메시지 번호입니다.
+	int frag_count; // 원본 메시지를 완성하는 데 필요한 전체 조각 수입니다.
+	int received_count; // 현재까지 받은 조각 수입니다.
+	int total_payload_len; // 재조립 후 UTF-8 Payload 전체 Byte 수입니다.
+	BOOL received[MAX_SEGMENT_COUNT]; // 각 조각 번호를 이미 받았는지 표시합니다.
+	Frame fragments[MAX_SEGMENT_COUNT]; // 수신한 Frame 조각을 frag_index 위치에 저장합니다.
+	DWORD last_update_tick; // 마지막으로 조각을 받은 시간을 저장해 오래된 미완성 메시지를 정리합니다.
+
+	ReassemblyMessage() // 새 재조립 버퍼가 쓰레기 값을 갖지 않도록 초기화합니다.
+	{
+		msg_id = 0; // 아직 어떤 원본 메시지도 담당하지 않는 상태로 초기화합니다.
+		frag_count = 0; // 필요한 전체 조각 수가 아직 정해지지 않은 상태로 초기화합니다.
+		received_count = 0; // 아직 받은 조각이 없음을 표시합니다.
+		total_payload_len = 0; // 아직 누적된 Payload Byte가 없음을 표시합니다.
+		last_update_tick = 0; // 아직 수신 시간이 기록되지 않았음을 표시합니다.
+
+		for (int index = 0; index < MAX_SEGMENT_COUNT; index++) // 모든 조각 저장 위치를 초기화합니다.
+		{
+			received[index] = FALSE; // 해당 조각을 아직 받지 않았다고 표시합니다.
+			fragments[index] = Frame(); // 해당 위치의 Frame 데이터를 빈 Frame으로 초기화합니다.
+		}
 	}
 };
 
@@ -82,4 +110,5 @@ public:
 	CString m_clientAddr; // 마지막으로 메시지를 보낸 클라이언트 IP 주소입니다.
 	UINT m_clientPort; // 마지막으로 메시지를 보낸 클라이언트 포트 번호입니다.
 	int m_nextMessageId; // 다음에 송신할 원본 메시지에 붙일 메시지 번호입니다.
+	CList<ReassemblyMessage, ReassemblyMessage&> m_reassemblyList; // 수신한 Frame 조각을 원본 메시지별로 임시 보관합니다.
 };
