@@ -13,8 +13,8 @@ const DWORD REASSEMBLY_TIMEOUT_MS = 5000; // 재전송 구현 전 단계에서 �
 
 struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 구조체입니다.
 {
-	int seq_num; // 이후 ARQ 구현에서 사용할 순서 번호 Header 필드입니다.
-	int ack_num; // 이후 ARQ 구현에서 사용할 응답 번호 Header 필드입니다.
+	int seq_num; // 송신 Frame마다 1씩 증가하는 순서 번호 Header 필드입니다.
+	int ack_num; // 마지막으로 정상 수신한 상대 Frame 번호를 함께 싣는 ACK Header 필드입니다.
 	int checksum; // Frame Header와 Payload 오류 검증에 사용할 16-bit Checksum Header 필드입니다.
 	int msg_id; // 여러 Frame으로 나뉜 조각들이 같은 원본 메시지인지 구분하는 메시지 번호입니다.
 	int frag_index; // 원본 메시지 안에서 현재 Frame이 몇 번째 조각인지 저장합니다.
@@ -24,8 +24,8 @@ struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 �
 
 	Frame() // 새 Frame이 쓰레기 값을 갖지 않도록 초기화합니다.
 	{
-		seq_num = 0; // packet 단계에서는 순서 번호 기능을 아직 사용하지 않으므로 0으로 초기화합니다.
-		ack_num = 0; // packet 단계에서는 ACK 번호 기능을 아직 사용하지 않으므로 0으로 초기화합니다.
+		seq_num = 0; // 아직 송신 순서 번호가 배정되지 않은 상태로 초기화합니다.
+		ack_num = 0; // 아직 정상 수신한 상대 Frame이 없음을 표시합니다.
 		checksum = 0; // Checksum 계산 전 기본값을 0으로 초기화합니다.
 		msg_id = 0; // 아직 어떤 원본 메시지에도 속하지 않은 상태로 초기화합니다.
 		frag_index = 0; // 첫 번째 조각을 기본값으로 초기화합니다.
@@ -110,6 +110,10 @@ public:
 	CEdit m_tx_edit_short; // 보낼 메시지를 입력하는 편집 컨트롤입니다.
 	CEdit m_packet_log_edit; // 패킷 생성, 송신, 수신 과정을 출력하는 로그 전용 편집 컨트롤입니다.
 	int m_nextMessageId; // 다음에 송신할 원본 메시지에 붙일 메시지 번호입니다.
+	int m_nextSeqNum; // 다음 송신 Frame에 붙일 순서 번호입니다.
+	int m_expectedSeqNum; // 다음에 정상 수신할 것으로 기대하는 상대 Frame 순서 번호입니다.
+	int m_lastAckNum; // 마지막으로 정상 수신해 ACK로 알려줄 상대 Frame 순서 번호입니다.
+	int m_lastReceivedAckNum; // 상대가 Piggyback으로 알려준 마지막 ACK 번호입니다.
 	BOOL m_corruptNextPacket; // Checksum 시연을 위해 다음 송신 Frame 하나를 일부러 손상할지 저장합니다.
 	CList<ReassemblyMessage, ReassemblyMessage&> m_reassemblyList; // 수신한 Frame 조각을 원본 메시지별로 임시 보관합니다.
 };

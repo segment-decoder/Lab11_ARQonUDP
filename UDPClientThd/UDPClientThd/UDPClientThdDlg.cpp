@@ -215,11 +215,87 @@ BOOL BuildFramesFromText(const CString& text, CList<Frame, Frame&>& frameList, i
 		segmentFrame.msg_id = messageId; // 원본 메시지를 구분할 메시지 번호를 저장합니다.
 		segmentFrame.frag_index = fragmentIndex; // 현재 조각의 0부터 시작하는 번호를 저장합니다.
 		segmentFrame.frag_count = fragmentCount; // 전체 조각 개수를 저장합니다.
-		segmentFrame.checksum = CalculateFrameChecksum(segmentFrame); // 완성된 Header와 Payload를 기준으로 Checksum 값을 계산해 저장합니다.
 		fragmentIndex++; // 다음 조각 번호로 이동합니다.
 	}
 
 	return !frameList.IsEmpty(); // 하나 이상의 Frame이 만들어졌는지 반환합니다.
+}
+
+void ApplySeqAckToFrames(CList<Frame, Frame&>& frameList, int& nextSeqNum, int lastAckNum, CEdit& edit) // 송신할 Frame들에 seq/ack를 채우고 Checksum을 다시 계산합니다.
+{
+	POSITION pos = frameList.GetHeadPosition(); // 송신할 Frame 리스트의 첫 위치를 가져옵니다.
+	while (pos != NULL) // 생성된 모든 Frame에 순서 번호와 Piggyback ACK를 기록합니다.
+	{
+		Frame& frame = frameList.GetNext(pos); // 현재 송신할 Frame을 참조로 가져옵니다.
+		frame.seq_num = nextSeqNum; // Frame 하나마다 증가하는 송신 순서 번호를 기록합니다.
+		frame.ack_num = lastAckNum; // 마지막 정상 수신 Frame 번호를 ACK로 함께 실어 보냅니다.
+		frame.checksum = CalculateFrameChecksum(frame); // seq/ack가 포함된 Header와 Payload 기준으로 Checksum을 계산합니다.
+
+		CString log; // 화면에 출력할 Piggyback 로그 문자열입니다.
+		log.Format(_T("[PIGGYBACK] seq=%d ack=%d msg=%d frag=%d/%d checksum=%d\r\n"), frame.seq_num, frame.ack_num, frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.checksum); // 데이터 Frame 안에 ACK가 함께 실렸음을 로그로 만듭니다.
+		AppendEditText(edit, log); // 지정한 출력창에 Piggyback 로그를 추가합니다.
+		nextSeqNum++; // 다음 송신 Frame이 사용할 순서 번호를 증가시킵니다.
+	}
+}
+
+void ProcessPiggybackAck(CEdit& edit, const Frame& frame, int& lastReceivedAckNum, int lastSentSeqNum) // 상대가 데이터 Frame에 실어 보낸 ACK 번호를 검증합니다.
+{
+	if (frame.ack_num <= 0) // ACK 0은 아직 상대가 정상 수신한 내 Frame이 없다는 뜻입니다.
+		return;
+
+	if (frame.ack_num > lastSentSeqNum) // 내가 아직 보내지 않은 Frame 번호를 ACK하면 비정상 ACK로 판단합니다.
+	{
+		CString ackWarnLog; // 화면에 출력할 ACK 경고 로그 문자열입니다.
+		ackWarnLog.Format(_T("[ACK WARN] ack=%d last_sent=%d reason=future\r\n"), frame.ack_num, lastSentSeqNum); // 미래 ACK 번호를 로그로 만듭니다.
+		AppendEditText(edit, ackWarnLog); // 지정한 출력창에 ACK 경고 로그를 추가합니다.
+		return;
+	}
+
+	if (frame.ack_num <= lastReceivedAckNum) // 이미 처리한 ACK와 같거나 더 작으면 중복 ACK로 판단합니다.
+	{
+		CString ackDupLog; // 화면에 출력할 중복 ACK 로그 문자열입니다.
+		ackDupLog.Format(_T("[ACK DUP] ack=%d last_ack=%d\r\n"), frame.ack_num, lastReceivedAckNum); // 중복 ACK 정보를 로그로 만듭니다.
+		AppendEditText(edit, ackDupLog); // 지정한 출력창에 중복 ACK 로그를 추가합니다.
+		return;
+	}
+
+	lastReceivedAckNum = frame.ack_num; // 새로 확인된 ACK 번호를 저장합니다.
+	CString ackReceiveLog; // 화면에 출력할 ACK 수신 로그 문자열입니다.
+	ackReceiveLog.Format(_T("[ACK RECV] ack=%d piggyback_seq=%d\r\n"), frame.ack_num, frame.seq_num); // 상대가 마지막으로 정상 수신한 내 Frame 번호를 로그로 만듭니다.
+	AppendEditText(edit, ackReceiveLog); // 지정한 출력창에 ACK 수신 로그를 추가합니다.
+}
+
+BOOL ProcessSeqAck(CEdit& edit, const Frame& frame, int& expectedSeqNum, int& lastAckNum, int& lastReceivedAckNum, int lastSentSeqNum) // Checksum을 통과한 Frame의 seq/ack 정보를 검증하고 ACK 상태를 갱신합니다.
+{
+	ProcessPiggybackAck(edit, frame, lastReceivedAckNum, lastSentSeqNum); // 데이터 Frame에 같이 실려 온 ACK 번호를 먼저 검증합니다.
+
+	if (frame.seq_num == expectedSeqNum) // 기대한 순서 번호의 Frame인지 확인합니다.
+	{
+		CString seqOkLog; // 화면에 출력할 순서 번호 정상 로그 문자열입니다.
+		seqOkLog.Format(_T("[SEQ OK] seq=%d expected=%d\r\n"), frame.seq_num, expectedSeqNum); // 기대값과 실제 수신 순서 번호가 같음을 로그로 만듭니다.
+		AppendEditText(edit, seqOkLog); // 지정한 출력창에 순서 번호 정상 로그를 추가합니다.
+
+		lastAckNum = frame.seq_num; // 정상 수신한 Frame 번호를 다음 송신 때 ACK로 보내도록 저장합니다.
+		expectedSeqNum++; // 다음에 기대할 상대 Frame 순서 번호를 증가시킵니다.
+
+		CString ackUpdateLog; // 화면에 출력할 ACK 갱신 로그 문자열입니다.
+		ackUpdateLog.Format(_T("[ACK UPDATE] ack=%d next_expected=%d\r\n"), lastAckNum, expectedSeqNum); // 새 ACK 값과 다음 기대 순서 번호를 로그로 만듭니다.
+		AppendEditText(edit, ackUpdateLog); // 지정한 출력창에 ACK 갱신 로그를 추가합니다.
+		return TRUE; // 정상 순서 Frame이므로 재조립 단계로 넘길 수 있음을 알립니다.
+	}
+
+	if (frame.seq_num < expectedSeqNum) // 이미 처리한 순서 번호가 다시 오면 중복 Frame으로 판단합니다.
+	{
+		CString seqDupLog; // 화면에 출력할 중복 Frame 로그 문자열입니다.
+		seqDupLog.Format(_T("[SEQ DUP] seq=%d expected=%d last_ack=%d\r\n"), frame.seq_num, expectedSeqNum, lastAckNum); // 중복 Frame 정보를 로그로 만듭니다.
+		AppendEditText(edit, seqDupLog); // 지정한 출력창에 중복 Frame 로그를 추가합니다.
+		return FALSE;
+	}
+
+	CString seqWarnLog; // 화면에 출력할 순서 번호 경고 로그 문자열입니다.
+	seqWarnLog.Format(_T("[SEQ WARN] seq=%d expected=%d reason=out_of_order\r\n"), frame.seq_num, expectedSeqNum); // 기대보다 큰 순서 번호라 아직 처리할 수 없음을 로그로 만듭니다.
+	AppendEditText(edit, seqWarnLog); // 지정한 출력창에 순서 번호 경고 로그를 추가합니다.
+	return FALSE; // 순서가 맞지 않는 Frame은 현재 단계에서 재조립 버퍼에 넣지 않습니다.
 }
 
 CString FramePayloadToText(const Frame& frame) // 수신한 Frame Payload를 화면 출력용 CString으로 복원합니다.
@@ -527,6 +603,10 @@ CUDPClientThdDlg::CUDPClientThdDlg(CWnd* pParent /*=nullptr*/)
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 	m_hSocket = INVALID_SOCKET; // UDP 소켓 핸들을 초기화합니다.
 	m_nextMessageId = 1; // 첫 번째 송신 메시지 번호를 1로 초기화합니다.
+	m_nextSeqNum = 1; // 첫 번째 송신 Frame 순서 번호를 1로 초기화합니다.
+	m_expectedSeqNum = 1; // 처음 받을 상대 Frame 순서 번호를 1로 기대합니다.
+	m_lastAckNum = 0; // 아직 정상 수신한 상대 Frame이 없음을 ACK 0으로 표시합니다.
+	m_lastReceivedAckNum = 0; // 아직 상대가 확인해 준 내 Frame이 없음을 표시합니다.
 	m_corruptNextPacket = FALSE; // 기본 상태에서는 송신 Frame을 손상하지 않도록 초기화합니다.
 }
 
@@ -701,6 +781,9 @@ void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스
 
 	AppendChecksumLog(m_packet_log_edit, _T("OK"), frame, calculatedChecksum); // Checksum 검증 성공 정보를 패킷 로그에 남깁니다.
 
+	if (!ProcessSeqAck(m_packet_log_edit, frame, m_expectedSeqNum, m_lastAckNum, m_lastReceivedAckNum, m_nextSeqNum - 1)) // Checksum을 통과한 Frame의 순서 번호와 ACK 정보를 검증합니다.
+		return;
+
 	rx_cs.Lock(); // 수신 리스트 접근을 잠급니다.
 	arg2.pList->AddTail(frame); // 받은 Frame 패킷을 수신 리스트에 추가합니다.
 	rx_cs.Unlock(); // 수신 리스트 접근 잠금을 풉니다.
@@ -725,6 +808,7 @@ void CUDPClientThdDlg::OnBnClickedSend() // Send 버튼 클릭 시 메시지를 
 	CString tx_log = tx_message + _T("\r\n"); // 송신 채팅창에 표시할 문자열에 줄바꿈을 추가합니다.
 	AppendEditText(m_tx_edit, tx_log); // 사용자가 보낸 원문 메시지를 송신창에 출력합니다.
 	AppendSegmentLog(m_packet_log_edit, messageId, messageBytes, (int)frameList.GetCount()); // 원본 메시지가 몇 개의 Frame으로 나뉘었는지 로그창에 출력합니다.
+	ApplySeqAckToFrames(frameList, m_nextSeqNum, m_lastAckNum, m_packet_log_edit); // 송신 Frame마다 seq와 Piggyback ACK를 채우고 Checksum을 계산합니다.
 
 	POSITION pos = frameList.GetHeadPosition(); // 생성된 Frame들을 CREATE 로그로 남기기 위해 첫 위치를 가져옵니다.
 	while (pos != NULL) // 생성된 모든 Frame 정보를 로그창에 출력합니다.
