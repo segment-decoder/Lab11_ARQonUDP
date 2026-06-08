@@ -34,10 +34,10 @@ int GetUtf8ByteCount(const CStringW& text) // CStringW가 UTF-8로 바뀔 때 �
 	return WideCharToMultiByte(CP_UTF8, 0, text, text.GetLength(), NULL, 0, NULL, NULL); // UTF-8 변환 결과의 Byte 수를 반환합니다.
 }
 
-BOOL LimitTextToPayloadSize(const CString& source, CString& limitedText) // 입력 문자열을 Frame Payload 16Byte 안에 들어가도록 자릅니다.
+BOOL LimitTextToMessageSize(const CString& source, CString& limitedText) // 입력 문자열을 전체 메시지 제한 256Byte 안에 들어가도록 자릅니다.
 {
 	CStringW sourceText(source); // Unicode CString을 UTF-8 Byte 계산용 문자열로 변환합니다.
-	CStringW limitedWideText; // 16Byte 안에 들어가는 문자만 누적합니다.
+	CStringW limitedWideText; // 256Byte 안에 들어가는 문자만 누적합니다.
 	int usedBytes = 0; // 현재까지 누적된 UTF-8 Byte 수입니다.
 	int index = 0; // UTF-16 문자 위치를 추적합니다.
 
@@ -55,7 +55,7 @@ BOOL LimitTextToPayloadSize(const CString& source, CString& limitedText) // 입�
 
 		CStringW unitText = sourceText.Mid(index, unitCount); // 현재 문자 단위를 UTF-8 Byte 계산 대상으로 잘라냅니다.
 		int unitBytes = WideCharToMultiByte(CP_UTF8, 0, unitText, unitCount, NULL, 0, NULL, NULL); // 현재 문자 단위의 UTF-8 Byte 수를 계산합니다.
-		if (usedBytes + unitBytes > FRAME_PAYLOAD_SIZE) // 16Byte를 넘으면 더 이상 입력을 받지 않습니다.
+		if (usedBytes + unitBytes > MAX_MESSAGE_BYTES) // 256Byte를 넘으면 더 이상 입력을 받지 않습니다.
 			break;
 
 		limitedWideText += unitText; // 제한 안에 들어가는 문자를 결과 문자열에 추가합니다.
@@ -67,21 +67,71 @@ BOOL LimitTextToPayloadSize(const CString& source, CString& limitedText) // 입�
 	return sourceText.GetLength() != limitedWideText.GetLength(); // 실제로 잘라낸 문자가 있는지 반환합니다.
 }
 
-BOOL BuildFrameFromText(const CString& text, Frame& frame) // 입력 문자열을 16Byte Payload를 가진 Frame 패킷으로 변환합니다.
+BOOL BuildFramesFromText(const CString& text, CList<Frame, Frame&>& frameList, int messageId, int& messageBytes) // 입력 문자열을 16Byte Payload를 가진 여러 Frame으로 분할합니다.
 {
 	CStringW wideText(text); // UI 입력 문자열을 UTF-8 변환용 Unicode 문자열로 준비합니다.
 	int utf8Bytes = GetUtf8ByteCount(wideText); // 전송 Payload에 들어갈 실제 Byte 수를 계산합니다.
+	Frame currentFrame; // 현재 채우고 있는 세그먼트 Frame입니다.
+	int index = 0; // UTF-16 문자 위치를 추적합니다.
+	int fragmentCount = 0; // 생성된 세그먼트 개수를 저장합니다.
+	POSITION pos; // 생성된 Frame 리스트를 다시 순회할 위치 값입니다.
+	int fragmentIndex = 0; // 각 Frame에 기록할 조각 번호입니다.
+
+	frameList.RemoveAll(); // 호출자가 넘긴 임시 Frame 리스트를 새 메시지 기준으로 비웁니다.
+	messageBytes = utf8Bytes; // 호출자가 로그에 표시할 전체 메시지 Byte 수를 저장합니다.
 
 	if (utf8Bytes <= 0) // 빈 메시지는 Frame으로 만들지 않습니다.
 		return FALSE;
 
-	if (utf8Bytes > FRAME_PAYLOAD_SIZE) // UI 제한을 우회한 16Byte 초과 입력은 송신하지 않습니다.
+	if (utf8Bytes > MAX_MESSAGE_BYTES) // UI 제한을 우회한 256Byte 초과 입력은 송신하지 않습니다.
 		return FALSE;
 
-	frame = Frame(); // 기존 Frame 내용을 초기화합니다.
-	frame.payload_len = utf8Bytes; // 수신자가 실제 Payload 길이를 알 수 있도록 Header 값을 채웁니다.
-	WideCharToMultiByte(CP_UTF8, 0, wideText, wideText.GetLength(), (LPSTR)frame.payload, FRAME_PAYLOAD_SIZE, NULL, NULL); // 입력 문자열을 UTF-8 Byte로 Payload에 저장합니다.
-	return TRUE; // Frame 생성 성공을 알립니다.
+	while (index < wideText.GetLength()) // 입력 문자열을 문자 단위로 읽으면서 Frame Payload를 채웁니다.
+	{
+		int unitCount = 1; // 기본적으로 UTF-16 코드 유닛 하나를 문자 단위로 봅니다.
+		WCHAR currentChar = wideText[index]; // 현재 검사 중인 UTF-16 코드 유닛입니다.
+
+		if (currentChar >= 0xD800 && currentChar <= 0xDBFF && index + 1 < wideText.GetLength()) // 서로게이트 쌍의 앞부분인지 확인합니다.
+		{
+			WCHAR nextChar = wideText[index + 1]; // 서로게이트 쌍의 뒷부분 후보를 가져옵니다.
+			if (nextChar >= 0xDC00 && nextChar <= 0xDFFF) // 올바른 서로게이트 쌍이면 두 코드 유닛을 같이 처리합니다.
+				unitCount = 2;
+		}
+
+		CStringW unitText = wideText.Mid(index, unitCount); // 현재 문자 단위를 UTF-8 변환 대상으로 잘라냅니다.
+		int unitBytes = WideCharToMultiByte(CP_UTF8, 0, unitText, unitCount, NULL, 0, NULL, NULL); // 현재 문자 단위가 차지할 UTF-8 Byte 수를 계산합니다.
+		if (unitBytes <= 0 || unitBytes > FRAME_PAYLOAD_SIZE) // 한 문자 단위가 Payload에 들어갈 수 없으면 Frame 생성을 중단합니다.
+			return FALSE;
+
+		if (currentFrame.payload_len + unitBytes > FRAME_PAYLOAD_SIZE) // 현재 Frame에 더 담을 수 없으면 새 Frame을 시작합니다.
+		{
+			frameList.AddTail(currentFrame); // 가득 찬 Frame을 임시 리스트에 추가합니다.
+			fragmentCount++; // 생성된 세그먼트 수를 증가시킵니다.
+			currentFrame = Frame(); // 다음 세그먼트를 담을 빈 Frame으로 초기화합니다.
+		}
+
+		WideCharToMultiByte(CP_UTF8, 0, unitText, unitCount, (LPSTR)(currentFrame.payload + currentFrame.payload_len), FRAME_PAYLOAD_SIZE - currentFrame.payload_len, NULL, NULL); // 현재 문자 단위를 Frame Payload 뒤쪽에 이어 붙입니다.
+		currentFrame.payload_len += unitBytes; // 현재 Frame의 실제 Payload Byte 수를 갱신합니다.
+		index += unitCount; // 다음 문자 단위로 이동합니다.
+	}
+
+	if (currentFrame.payload_len > 0) // 마지막 Frame에 남은 Payload가 있으면 리스트에 추가합니다.
+	{
+		frameList.AddTail(currentFrame); // 마지막 세그먼트 Frame을 임시 리스트에 추가합니다.
+		fragmentCount++; // 생성된 세그먼트 수를 증가시킵니다.
+	}
+
+	pos = frameList.GetHeadPosition(); // 생성된 Frame들의 Header를 채우기 위해 리스트 처음 위치를 가져옵니다.
+	while (pos != NULL) // 모든 Frame에 동일한 메시지 번호와 조각 정보를 기록합니다.
+	{
+		Frame& segmentFrame = frameList.GetNext(pos); // 현재 조각 Frame을 참조로 가져옵니다.
+		segmentFrame.msg_id = messageId; // 원본 메시지를 구분할 메시지 번호를 저장합니다.
+		segmentFrame.frag_index = fragmentIndex; // 현재 조각의 0부터 시작하는 번호를 저장합니다.
+		segmentFrame.frag_count = fragmentCount; // 전체 조각 개수를 저장합니다.
+		fragmentIndex++; // 다음 조각 번호로 이동합니다.
+	}
+
+	return !frameList.IsEmpty(); // 하나 이상의 Frame이 만들어졌는지 반환합니다.
 }
 
 CString FramePayloadToText(const Frame& frame) // 수신한 Frame Payload를 화면 출력용 CString으로 복원합니다.
@@ -104,8 +154,32 @@ void AppendPacketLog(CEdit& edit, LPCTSTR action, const Frame& frame, int packet
 {
 	CString payloadText = FramePayloadToText(frame); // 로그에 보여줄 Payload 문자열을 복원합니다.
 	CString log; // 화면에 출력할 패킷 로그 문자열입니다.
-	log.Format(_T("[%s PACKET] packet_bytes=%d seq=%d ack=%d checksum=%d payload_len=%d payload=\"%s\"\r\n"), action, packetBytes, frame.seq_num, frame.ack_num, frame.checksum, frame.payload_len, payloadText.GetString()); // Header 값과 Payload 정보를 포함한 로그를 만듭니다.
+	log.Format(_T("[%s PACKET] packet_bytes=%d seq=%d ack=%d checksum=%d msg=%d frag=%d/%d payload_len=%d payload=\"%s\"\r\n"), action, packetBytes, frame.seq_num, frame.ack_num, frame.checksum, frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.payload_len, payloadText.GetString()); // Header 값과 세그먼트 정보를 포함한 로그를 만듭니다.
 	AppendEditText(edit, log); // 지정한 출력창에 패킷 로그를 추가합니다.
+}
+
+void AppendSegmentLog(CEdit& edit, int messageId, int messageBytes, int fragmentCount) // 원본 메시지가 몇 개의 Frame으로 분할되었는지 로그로 출력합니다.
+{
+	CString log; // 화면에 출력할 세그먼트 로그 문자열입니다.
+	log.Format(_T("[SEGMENT] msg=%d message_bytes=%d fragments=%d payload_limit=%d\r\n"), messageId, messageBytes, fragmentCount, FRAME_PAYLOAD_SIZE); // 메시지 번호, 전체 Byte 수, 조각 수를 포함한 로그를 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 세그먼트 로그를 추가합니다.
+}
+
+BOOL IsValidSegmentHeader(const Frame& frame) // 수신한 Frame의 세그먼트 Header 값이 정상 범위인지 확인합니다.
+{
+	if (frame.msg_id <= 0) // 메시지 번호는 1 이상이어야 합니다.
+		return FALSE;
+
+	if (frame.frag_count <= 0) // 전체 조각 수는 1 이상이어야 합니다.
+		return FALSE;
+
+	if (frame.frag_index < 0) // 조각 번호는 음수가 될 수 없습니다.
+		return FALSE;
+
+	if (frame.frag_index >= frame.frag_count) // 조각 번호는 전체 조각 수보다 작아야 합니다.
+		return FALSE;
+
+	return TRUE; // 세그먼트 Header 값이 모두 정상임을 알립니다.
 }
 
 UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하는 스레드 함수입니다.
@@ -179,8 +253,9 @@ UINT RXThread(LPVOID arg) // UDP로 받은 메시지를 화면에 출력하는 �
 				break;
 
 			CString payloadText = FramePayloadToText(frame); // 수신한 Payload를 채팅창 출력 문자열로 복원합니다.
-			payloadText += _T("\r\n"); // 채팅창에서 메시지 단위를 구분하기 위해 줄바꿈을 추가합니다.
-			AppendEditText(pDlg->m_rx_edit, payloadText); // 복원된 채팅 메시지를 수신창에 출력합니다.
+			CString segmentText; // 수신창에 표시할 세그먼트 단위 문자열입니다.
+			segmentText.Format(_T("[msg=%d frag=%d/%d] %s\r\n"), frame.msg_id, frame.frag_index + 1, frame.frag_count, payloadText.GetString()); // 조각 번호와 Payload를 함께 표시합니다.
+			AppendEditText(pDlg->m_rx_edit, segmentText); // 복원된 세그먼트 메시지를 수신창에 출력합니다.
 			AppendPacketLog(pDlg->m_packet_log_edit, _T("RECV"), frame, sizeof(Frame)); // 받은 Frame 정보를 패킷 로그창에 출력합니다.
 		}
 
@@ -234,6 +309,7 @@ CUDPServerThdDlg::CUDPServerThdDlg(CWnd* pParent /*=nullptr*/)
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 	m_hSocket = INVALID_SOCKET; // UDP 소켓 핸들을 초기화합니다.
 	m_clientPort = 0; // 마지막 클라이언트 포트 번호를 초기화합니다.
+	m_nextMessageId = 1; // 첫 번째 송신 메시지 번호를 1로 초기화합니다.
 }
 
 void CUDPServerThdDlg::DoDataExchange(CDataExchange* pDX)
@@ -286,7 +362,7 @@ BOOL CUDPServerThdDlg::OnInitDialog()
 	SetIcon(m_hIcon, TRUE);			// 큰 아이콘을 설정합니다.
 	SetIcon(m_hIcon, FALSE);		// 작은 아이콘을 설정합니다.
 
-	m_tx_edit_short.SetLimitText(FRAME_PAYLOAD_SIZE); // 영문 기준 16자 이상 입력되지 않도록 기본 제한을 설정합니다.
+	m_tx_edit_short.SetLimitText(MAX_MESSAGE_BYTES); // 영문 기준 256자 이상 입력되지 않도록 기본 제한을 설정합니다.
 
 	CList<Frame, Frame&>* newlist = new CList<Frame, Frame&>; // 송신 Frame 패킷을 저장할 리스트를 생성합니다.
 	arg1.pList = newlist; // 송신 스레드 인자에 송신 리스트를 저장합니다.
@@ -395,6 +471,12 @@ void CUDPServerThdDlg::ProcessReceive() // UDP 메시지를 받고 보낸 클라
 		return;
 	}
 
+	if (!IsValidSegmentHeader(frame)) // 메시지 번호와 조각 번호가 정상 범위인지 확인합니다.
+	{
+		AppendEditText(m_packet_log_edit, _T("[RECV DROP] invalid segment header\r\n")); // 잘못된 세그먼트 Header를 로그에 남깁니다.
+		return;
+	}
+
 	TCHAR addrText[32]; // 보낸 클라이언트 IP 주소 문자열 버퍼입니다.
 	InetNtop(AF_INET, &peer_addr.sin_addr, addrText, 32); // 보낸 클라이언트 IP 주소를 문자열로 변환합니다.
 	PeerAddr = addrText; // 변환된 클라이언트 IP 주소를 저장합니다.
@@ -410,42 +492,57 @@ void CUDPServerThdDlg::ProcessReceive() // UDP 메시지를 받고 보낸 클라
 void CUDPServerThdDlg::OnBnClickedSend() // Send 버튼 클릭 시 메시지를 송신 리스트에 넣습니다.
 {
 	CString tx_message; // 사용자가 입력한 송신 메시지입니다.
-	Frame frame; // 입력 메시지를 담을 Frame 패킷입니다.
+	CList<Frame, Frame&> frameList; // 입력 메시지를 분할해 만든 Frame 패킷들을 임시로 저장합니다.
+	int messageBytes = 0; // 전체 원본 메시지의 UTF-8 Byte 수를 저장합니다.
+	int messageId = m_nextMessageId; // 이번 송신 메시지에 사용할 메시지 번호를 저장합니다.
 	m_tx_edit_short.GetWindowTextW(tx_message); // 입력창의 문자열을 가져옵니다.
 
-	if (!BuildFrameFromText(tx_message, frame)) // 입력 문자열이 Frame Payload 제한에 맞는지 확인합니다.
+	if (!BuildFramesFromText(tx_message, frameList, messageId, messageBytes)) // 입력 문자열을 16Byte Frame들로 분할할 수 있는지 확인합니다.
 	{
-		AppendEditText(m_packet_log_edit, _T("[SEND SKIP] payload must be 1-16 bytes\r\n")); // 전송하지 않은 이유를 패킷 로그에 남깁니다.
+		AppendEditText(m_packet_log_edit, _T("[SEND SKIP] message must be 1-256 bytes\r\n")); // 전송하지 않은 이유를 패킷 로그에 남깁니다.
 		m_tx_edit_short.SetFocus(); // 사용자가 바로 다시 입력할 수 있도록 포커스를 돌립니다.
 		return;
 	}
 
+	m_nextMessageId++; // 다음 송신 메시지에 사용할 메시지 번호를 증가시킵니다.
 	CString tx_log = tx_message + _T("\r\n"); // 송신 채팅창에 표시할 문자열에 줄바꿈을 추가합니다.
 	AppendEditText(m_tx_edit, tx_log); // 사용자가 보낸 원문 메시지를 송신창에 출력합니다.
-	AppendPacketLog(m_packet_log_edit, _T("CREATE"), frame, sizeof(Frame)); // 생성된 Frame 정보를 패킷 로그창에 출력합니다.
+	AppendSegmentLog(m_packet_log_edit, messageId, messageBytes, (int)frameList.GetCount()); // 원본 메시지가 몇 개의 Frame으로 나뉘었는지 로그창에 출력합니다.
+
+	POSITION pos = frameList.GetHeadPosition(); // 생성된 Frame들을 CREATE 로그로 남기기 위해 첫 위치를 가져옵니다.
+	while (pos != NULL) // 생성된 모든 Frame 정보를 로그창에 출력합니다.
+	{
+		Frame frame = frameList.GetNext(pos); // 로그로 출력할 Frame을 임시 변수에 복사합니다.
+		AppendPacketLog(m_packet_log_edit, _T("CREATE"), frame, sizeof(Frame)); // 생성된 Frame 정보를 패킷 로그창에 출력합니다.
+	}
 
 	tx_cs.Lock(); // 송신 리스트 접근을 잠급니다.
-	arg1.pList->AddTail(frame); // 송신할 Frame 패킷을 리스트에 추가합니다.
+	pos = frameList.GetHeadPosition(); // 생성된 Frame들을 송신 리스트에 넣기 위해 첫 위치를 다시 가져옵니다.
+	while (pos != NULL) // 생성된 모든 Frame을 송신 대기열에 추가합니다.
+	{
+		Frame frame = frameList.GetNext(pos); // 송신 리스트에 넣을 Frame을 임시 변수에 복사합니다.
+		arg1.pList->AddTail(frame); // 송신할 Frame 패킷을 리스트에 추가합니다.
+	}
 	tx_cs.Unlock(); // 송신 리스트 접근 잠금을 풉니다.
 
 	m_tx_edit_short.SetWindowTextW(_T("")); // 입력창을 비웁니다.
 	m_tx_edit_short.SetFocus(); // 입력창으로 포커스를 이동합니다.
 }
 
-void CUDPServerThdDlg::OnEnChangeEdit1() // 입력창의 UTF-8 Byte 수가 16Byte를 넘지 않도록 즉시 제한합니다.
+void CUDPServerThdDlg::OnEnChangeEdit1() // 입력창의 UTF-8 Byte 수가 256Byte를 넘지 않도록 즉시 제한합니다.
 {
 	if (g_isTrimmingInput) // 코드가 입력창을 갱신하는 중이면 재진입을 막습니다.
 		return;
 
 	CString currentText; // 현재 입력창 문자열을 저장합니다.
-	CString limitedText; // 16Byte 안에 들어가는 문자열만 저장합니다.
+	CString limitedText; // 256Byte 안에 들어가는 문자열만 저장합니다.
 	m_tx_edit_short.GetWindowTextW(currentText); // 현재 입력창 문자열을 읽습니다.
 
-	if (!LimitTextToPayloadSize(currentText, limitedText)) // 이미 16Byte 이하이면 수정하지 않습니다.
+	if (!LimitTextToMessageSize(currentText, limitedText)) // 이미 256Byte 이하이면 수정하지 않습니다.
 		return;
 
 	g_isTrimmingInput = TRUE; // SetWindowTextW로 발생할 EN_CHANGE 재진입을 막습니다.
-	m_tx_edit_short.SetWindowTextW(limitedText); // 16Byte를 넘는 부분을 제거한 문자열로 입력창을 갱신합니다.
+	m_tx_edit_short.SetWindowTextW(limitedText); // 256Byte를 넘는 부분을 제거한 문자열로 입력창을 갱신합니다.
 	m_tx_edit_short.SetSel(limitedText.GetLength(), limitedText.GetLength()); // 커서를 제한된 문자열 끝으로 이동합니다.
 	g_isTrimmingInput = FALSE; // 입력 제한 작업이 끝났음을 표시합니다.
 }
