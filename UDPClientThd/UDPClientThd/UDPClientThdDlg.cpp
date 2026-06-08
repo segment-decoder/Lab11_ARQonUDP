@@ -34,6 +34,77 @@ int GetUtf8ByteCount(const CStringW& text) // CStringW가 UTF-8로 바뀔 때 �
 	return WideCharToMultiByte(CP_UTF8, 0, text, text.GetLength(), NULL, 0, NULL, NULL); // UTF-8 변환 결과의 Byte 수를 반환합니다.
 }
 
+void AddChecksumWord(DWORD& sum, WORD word) // 16-bit 단어를 Checksum 누적합에 더하고 carry를 접습니다.
+{
+	sum += word; // 새 16-bit 단어를 누적합에 더합니다.
+	while ((sum >> 16) != 0) // 16-bit 범위를 넘는 carry가 남아 있으면 반복해서 접습니다.
+		sum = (sum & 0xFFFF) + (sum >> 16);
+}
+
+void AddChecksumInt(DWORD& sum, int value) // 32-bit Header 값을 16-bit 단어 두 개로 나누어 Checksum에 반영합니다.
+{
+	DWORD unsignedValue = (DWORD)value; // 비트 패턴을 유지한 채 32-bit 값으로 변환합니다.
+	AddChecksumWord(sum, (WORD)((unsignedValue >> 16) & 0xFFFF)); // Header 값의 상위 16-bit를 누적합니다.
+	AddChecksumWord(sum, (WORD)(unsignedValue & 0xFFFF)); // Header 값의 하위 16-bit를 누적합니다.
+}
+
+void AddChecksumPayload(DWORD& sum, const BYTE* payload, int payloadLen) // Payload Byte들을 16-bit 단어 단위로 Checksum에 반영합니다.
+{
+	for (int index = 0; index < payloadLen; index += 2) // Payload를 앞에서부터 2Byte씩 묶어 처리합니다.
+	{
+		WORD word = ((WORD)payload[index]) << 8; // 첫 번째 Byte를 16-bit 단어의 상위 Byte로 배치합니다.
+		if (index + 1 < payloadLen) // 짝이 되는 두 번째 Byte가 있으면 하위 Byte로 배치합니다.
+			word |= payload[index + 1];
+
+		AddChecksumWord(sum, word); // 완성된 16-bit Payload 단어를 누적합니다.
+	}
+}
+
+int CalculateFrameChecksum(const Frame& frame) // Frame Header와 실제 Payload를 기준으로 16-bit 1의 보수 Checksum을 계산합니다.
+{
+	DWORD sum = 0; // Checksum 계산에 사용할 32-bit 누적합입니다.
+	AddChecksumInt(sum, frame.seq_num); // 순서 번호 Header 값을 Checksum에 반영합니다.
+	AddChecksumInt(sum, frame.ack_num); // ACK 번호 Header 값을 Checksum에 반영합니다.
+	AddChecksumInt(sum, frame.msg_id); // 메시지 번호 Header 값을 Checksum에 반영합니다.
+	AddChecksumInt(sum, frame.frag_index); // 조각 번호 Header 값을 Checksum에 반영합니다.
+	AddChecksumInt(sum, frame.frag_count); // 전체 조각 수 Header 값을 Checksum에 반영합니다.
+	AddChecksumInt(sum, frame.payload_len); // 실제 Payload 길이 Header 값을 Checksum에 반영합니다.
+	AddChecksumPayload(sum, frame.payload, frame.payload_len); // 실제 Payload Byte를 Checksum에 반영합니다.
+	while ((sum >> 16) != 0) // 마지막으로 남은 carry가 있으면 16-bit로 접습니다.
+		sum = (sum & 0xFFFF) + (sum >> 16);
+
+	return (int)(~sum & 0xFFFF); // 1의 보수를 취해 16-bit Checksum 값으로 반환합니다.
+}
+
+BOOL VerifyFrameChecksum(const Frame& frame, int& calculatedChecksum) // 수신 Frame의 Checksum이 재계산 결과와 같은지 확인합니다.
+{
+	calculatedChecksum = CalculateFrameChecksum(frame); // 수신 Frame을 기준으로 Checksum을 다시 계산합니다.
+	return frame.checksum == calculatedChecksum; // Frame에 담긴 Checksum과 재계산 결과가 같은지 반환합니다.
+}
+
+void AppendChecksumLog(CEdit& edit, LPCTSTR result, const Frame& frame, int calculatedChecksum) // Checksum 검증 결과를 패킷 로그창에 출력합니다.
+{
+	CString log; // 화면에 출력할 Checksum 로그 문자열입니다.
+	log.Format(_T("[CHECKSUM %s] msg=%d frag=%d/%d recv=%d calc=%d\r\n"), result, frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.checksum, calculatedChecksum); // 수신 Checksum과 재계산 Checksum을 비교할 수 있는 로그를 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 Checksum 검증 로그를 추가합니다.
+}
+
+BOOL CorruptFrameForChecksumDemo(Frame& frame) // Checksum 실패 시연을 위해 Frame Payload 일부를 고의로 손상합니다.
+{
+	if (frame.payload_len <= 0) // 손상할 Payload가 없으면 실패로 반환합니다.
+		return FALSE;
+
+	frame.payload[0] ^= 0x01; // Checksum은 그대로 둔 채 첫 Payload Byte의 마지막 bit를 뒤집습니다.
+	return TRUE; // Frame 손상이 완료되었음을 알립니다.
+}
+
+void AppendCorruptPacketLog(CEdit& edit, const Frame& frame) // 고의 손상한 Frame 정보를 패킷 로그창에 출력합니다.
+{
+	CString log; // 화면에 출력할 고의 손상 로그 문자열입니다.
+	log.Format(_T("[CORRUPT PACKET] msg=%d frag=%d/%d payload_byte=0 checksum_kept=%d\r\n"), frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.checksum); // 어떤 Frame을 손상했는지 확인 가능한 로그를 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 고의 손상 로그를 추가합니다.
+}
+
 CString Utf8BytesToText(const BYTE* payload, int payloadLen, int maxBytes) // UTF-8 Byte 배열을 화면 출력용 CString으로 복원합니다.
 {
 	if (payloadLen <= 0 || payloadLen > maxBytes) // Byte 길이가 허용 범위를 벗어나면 빈 문자열을 반환합니다.
@@ -144,6 +215,7 @@ BOOL BuildFramesFromText(const CString& text, CList<Frame, Frame&>& frameList, i
 		segmentFrame.msg_id = messageId; // 원본 메시지를 구분할 메시지 번호를 저장합니다.
 		segmentFrame.frag_index = fragmentIndex; // 현재 조각의 0부터 시작하는 번호를 저장합니다.
 		segmentFrame.frag_count = fragmentCount; // 전체 조각 개수를 저장합니다.
+		segmentFrame.checksum = CalculateFrameChecksum(segmentFrame); // 완성된 Header와 Payload를 기준으로 Checksum 값을 계산해 저장합니다.
 		fragmentIndex++; // 다음 조각 번호로 이동합니다.
 	}
 
@@ -348,6 +420,14 @@ UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하�
 				server_addr.sin_family = AF_INET; // IPv4 주소 체계를 사용합니다.
 				server_addr.sin_port = htons(8000); // 서버 포트 번호를 8000번으로 설정합니다.
 				InetPton(AF_INET, addr, &server_addr.sin_addr); // 서버 IP 주소를 저장합니다.
+				if (pDlg->m_corruptNextPacket) // Checksum 시연 예약이 있으면 이번 송신 Frame 하나를 손상합니다.
+				{
+					pDlg->m_corruptNextPacket = FALSE; // 한 번만 손상되도록 예약 플래그를 즉시 끕니다.
+					if (CorruptFrameForChecksumDemo(frame)) // Checksum은 유지하고 Payload만 일부 변경합니다.
+						AppendCorruptPacketLog(pDlg->m_packet_log_edit, frame); // 손상된 Frame 정보를 패킷 로그창에 출력합니다.
+					else // 손상할 Payload가 없으면 실패 로그를 남깁니다.
+						AppendEditText(pDlg->m_packet_log_edit, _T("[CORRUPT SKIP] payload is empty\r\n"));
+				}
 				int sentBytes = sendto(pDlg->m_hSocket, (char*)&frame, sizeof(Frame), 0, (SOCKADDR*)&server_addr, sizeof(server_addr)); // Frame 구조체 전체를 UDP 패킷으로 보냅니다.
 				if (sentBytes != SOCKET_ERROR) // 전송이 성공하면 패킷 로그를 남깁니다.
 					AppendPacketLog(pDlg->m_packet_log_edit, _T("SEND"), frame, sentBytes);
@@ -447,6 +527,7 @@ CUDPClientThdDlg::CUDPClientThdDlg(CWnd* pParent /*=nullptr*/)
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 	m_hSocket = INVALID_SOCKET; // UDP 소켓 핸들을 초기화합니다.
 	m_nextMessageId = 1; // 첫 번째 송신 메시지 번호를 1로 초기화합니다.
+	m_corruptNextPacket = FALSE; // 기본 상태에서는 송신 Frame을 손상하지 않도록 초기화합니다.
 }
 
 void CUDPClientThdDlg::DoDataExchange(CDataExchange* pDX)
@@ -465,6 +546,7 @@ BEGIN_MESSAGE_MAP(CUDPClientThdDlg, CDialogEx)
 	ON_WM_QUERYDRAGICON()
 	ON_BN_CLICKED(IDC_SEND, &CUDPClientThdDlg::OnBnClickedSend)
 	ON_BN_CLICKED(IDC_CLOSE, &CUDPClientThdDlg::OnBnClickedClose)
+	ON_BN_CLICKED(IDC_CORRUPT_NEXT, &CUDPClientThdDlg::OnBnClickedCorruptNext)
 	ON_EN_CHANGE(IDC_EDIT1, &CUDPClientThdDlg::OnEnChangeEdit1)
 END_MESSAGE_MAP()
 
@@ -610,6 +692,15 @@ void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스
 		return;
 	}
 
+	int calculatedChecksum = 0; // 수신 Frame을 다시 계산한 Checksum 값을 저장합니다.
+	if (!VerifyFrameChecksum(frame, calculatedChecksum)) // 수신 Checksum과 재계산 Checksum이 같은지 검증합니다.
+	{
+		AppendChecksumLog(m_packet_log_edit, _T("FAIL"), frame, calculatedChecksum); // Checksum 불일치 정보를 패킷 로그에 남깁니다.
+		return;
+	}
+
+	AppendChecksumLog(m_packet_log_edit, _T("OK"), frame, calculatedChecksum); // Checksum 검증 성공 정보를 패킷 로그에 남깁니다.
+
 	rx_cs.Lock(); // 수신 리스트 접근을 잠급니다.
 	arg2.pList->AddTail(frame); // 받은 Frame 패킷을 수신 리스트에 추가합니다.
 	rx_cs.Unlock(); // 수신 리스트 접근 잠금을 풉니다.
@@ -653,6 +744,12 @@ void CUDPClientThdDlg::OnBnClickedSend() // Send 버튼 클릭 시 메시지를 
 
 	m_tx_edit_short.SetWindowTextW(_T("")); // 입력창을 비웁니다.
 	m_tx_edit_short.SetFocus(); // 입력창으로 포커스를 이동합니다.
+}
+
+void CUDPClientThdDlg::OnBnClickedCorruptNext() // Corrupt 버튼 클릭 시 다음 송신 Frame 하나를 손상하도록 예약합니다.
+{
+	m_corruptNextPacket = TRUE; // TXThread가 다음 송신 Frame을 고의로 손상하도록 플래그를 켭니다.
+	AppendEditText(m_packet_log_edit, _T("[CORRUPT READY] next outgoing packet will be damaged\r\n")); // 사용자가 시연 예약 상태를 볼 수 있도록 로그를 남깁니다.
 }
 
 void CUDPClientThdDlg::OnEnChangeEdit1() // 입력창의 UTF-8 Byte 수가 256Byte를 넘지 않도록 즉시 제한합니다.

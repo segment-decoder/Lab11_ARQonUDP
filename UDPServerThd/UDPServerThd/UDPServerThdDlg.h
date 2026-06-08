@@ -15,7 +15,7 @@ struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 �
 {
 	int seq_num; // 이후 ARQ 구현에서 사용할 순서 번호 Header 필드입니다.
 	int ack_num; // 이후 ARQ 구현에서 사용할 응답 번호 Header 필드입니다.
-	int checksum; // 이후 오류 검증 구현에서 사용할 Checksum Header 필드입니다.
+	int checksum; // Frame Header와 Payload 오류 검증에 사용할 16-bit Checksum Header 필드입니다.
 	int msg_id; // 여러 Frame으로 나뉜 조각들이 같은 원본 메시지인지 구분하는 메시지 번호입니다.
 	int frag_index; // 원본 메시지 안에서 현재 Frame이 몇 번째 조각인지 저장합니다.
 	int frag_count; // 원본 메시지가 총 몇 개의 Frame으로 나뉘었는지 저장합니다.
@@ -26,7 +26,7 @@ struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 �
 	{
 		seq_num = 0; // packet 단계에서는 순서 번호 기능을 아직 사용하지 않으므로 0으로 초기화합니다.
 		ack_num = 0; // packet 단계에서는 ACK 번호 기능을 아직 사용하지 않으므로 0으로 초기화합니다.
-		checksum = 0; // packet 단계에서는 Checksum 기능을 아직 사용하지 않으므로 0으로 초기화합니다.
+		checksum = 0; // Checksum 계산 전 기본값을 0으로 초기화합니다.
 		msg_id = 0; // 아직 어떤 원본 메시지에도 속하지 않은 상태로 초기화합니다.
 		frag_index = 0; // 첫 번째 조각을 기본값으로 초기화합니다.
 		frag_count = 0; // 아직 조각 총수가 정해지지 않은 상태로 초기화합니다.
@@ -95,6 +95,7 @@ protected:
 	afx_msg HCURSOR OnQueryDragIcon();
 	afx_msg void OnBnClickedSend(); // Send 버튼 클릭 시 송신 리스트에 메시지를 넣습니다.
 	afx_msg void OnBnClickedClose(); // Close 버튼 클릭 시 소켓과 스레드를 종료합니다.
+	afx_msg void OnBnClickedCorruptNext(); // Corrupt 버튼 클릭 시 다음 송신 Frame을 일부러 손상하도록 예약합니다.
 	afx_msg void OnEnChangeEdit1(); // 입력창 내용이 바뀔 때 256Byte 초과 입력을 제한합니다.
 	DECLARE_MESSAGE_MAP()
 
@@ -110,5 +111,6 @@ public:
 	CString m_clientAddr; // 마지막으로 메시지를 보낸 클라이언트 IP 주소입니다.
 	UINT m_clientPort; // 마지막으로 메시지를 보낸 클라이언트 포트 번호입니다.
 	int m_nextMessageId; // 다음에 송신할 원본 메시지에 붙일 메시지 번호입니다.
+	BOOL m_corruptNextPacket; // Checksum 시연을 위해 다음 송신 Frame 하나를 일부러 손상할지 저장합니다.
 	CList<ReassemblyMessage, ReassemblyMessage&> m_reassemblyList; // 수신한 Frame 조각을 원본 메시지별로 임시 보관합니다.
 };

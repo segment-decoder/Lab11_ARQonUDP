@@ -15,6 +15,7 @@
 #define IDC_BUTTON3                     1006
 #define IDC_CLOSE                       1006
 #define IDC_PACKET_LOG                  1007
+#define IDC_CORRUPT_NEXT                1008 // Checksum 시연을 위해 다음 송신 Frame을 손상시키는 버튼 ID입니다.
 
 // Next default values for new objects
 // 
@@ -22,7 +23,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        130
 #define _APS_NEXT_COMMAND_VALUE         32771
-#define _APS_NEXT_CONTROL_VALUE         1008
+#define _APS_NEXT_CONTROL_VALUE         1009
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
