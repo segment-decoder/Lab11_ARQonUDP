@@ -10,6 +10,9 @@ const int FRAME_PAYLOAD_SIZE = 16; // 과제 조건에 맞춰 Frame 하나의 �
 const int MAX_MESSAGE_BYTES = 256; // 세그먼트 단계에서 한 번에 입력할 수 있는 전체 메시지 크기를 256Byte로 제한합니다.
 const int MAX_SEGMENT_COUNT = (MAX_MESSAGE_BYTES + FRAME_PAYLOAD_SIZE - 1) / FRAME_PAYLOAD_SIZE; // 256Byte 메시지가 최대 몇 개의 Frame으로 나뉘는지 계산합니다.
 const DWORD REASSEMBLY_TIMEOUT_MS = 5000; // 재전송 구현 전 단계에서 너무 오래 남은 미완성 재조립 메시지를 정리하는 시간입니다.
+const DWORD STOP_WAIT_TIMEOUT_MS = 1000; // Stop-and-Wait에서 ACK를 기다릴 최대 시간을 1초로 설정합니다.
+const int STOP_WAIT_MAX_RETRY = 3; // Stop-and-Wait에서 같은 Frame을 최대 3번까지 재전송합니다.
+const BYTE XOR_KEY = 0x5A; // Payload를 XOR 방식으로 암호화하고 복호화할 때 사용할 고정 1Byte Key입니다.
 
 struct Frame // UDP로 전송할 Header와 Payload를 하나로 묶은 패킷 구조체입니다.
 {
@@ -114,6 +117,11 @@ public:
 	int m_expectedSeqNum; // 다음에 정상 수신할 것으로 기대하는 상대 Frame 순서 번호입니다.
 	int m_lastAckNum; // 마지막으로 정상 수신해 ACK로 알려줄 상대 Frame 순서 번호입니다.
 	int m_lastReceivedAckNum; // 상대가 Piggyback으로 알려준 마지막 ACK 번호입니다.
+	BOOL m_waitingAck; // Stop-and-Wait에서 현재 ACK를 기다리는 중인지 저장합니다.
+	Frame m_waitFrame; // Stop-and-Wait에서 ACK를 받을 때까지 보관할 마지막 송신 Frame입니다.
+	int m_waitAckNum; // Stop-and-Wait에서 기다리는 ACK 번호를 저장합니다.
+	int m_retryCount; // Stop-and-Wait에서 현재 Frame을 몇 번 재전송했는지 저장합니다.
+	DWORD m_lastSendTick; // Stop-and-Wait에서 마지막 송신 시각을 저장해 Timeout을 판단합니다.
 	BOOL m_corruptNextPacket; // Checksum 시연을 위해 다음 송신 Frame 하나를 일부러 손상할지 저장합니다.
 	CList<ReassemblyMessage, ReassemblyMessage&> m_reassemblyList; // 수신한 Frame 조각을 원본 메시지별로 임시 보관합니다.
 };

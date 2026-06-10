@@ -82,9 +82,21 @@ BOOL VerifyFrameChecksum(const Frame& frame, int& calculatedChecksum) // 수신 
 	return frame.checksum == calculatedChecksum; // Frame에 담긴 Checksum과 재계산 결과가 같은지 반환합니다.
 }
 
+BOOL IsAckOnlyFrame(const Frame& frame) // Payload 없이 ACK만 전달하는 Stop-and-Wait 제어 Frame인지 확인합니다.
+{
+	return frame.seq_num == 0 && frame.ack_num > 0 && frame.msg_id == 0 && frame.frag_index == 0 && frame.frag_count == 0 && frame.payload_len == 0; // ACK 전용 Frame은 데이터 Header와 Payload를 모두 비워 구분합니다.
+}
+
 void AppendChecksumLog(CEdit& edit, LPCTSTR result, const Frame& frame, int calculatedChecksum) // Checksum 검증 결과를 패킷 로그창에 출력합니다.
 {
 	CString log; // 화면에 출력할 Checksum 로그 문자열입니다.
+	if (IsAckOnlyFrame(frame)) // ACK 전용 Frame이면 조각 정보 대신 ACK 번호를 중심으로 출력합니다.
+	{
+		log.Format(_T("[CHECKSUM %s] ack_only ack=%d recv=%d calc=%d\r\n"), result, frame.ack_num, frame.checksum, calculatedChecksum); // ACK 전용 Frame의 Checksum 비교 결과를 로그로 만듭니다.
+		AppendEditText(edit, log); // 지정한 출력창에 ACK 전용 Checksum 로그를 추가합니다.
+		return;
+	}
+
 	log.Format(_T("[CHECKSUM %s] msg=%d frag=%d/%d recv=%d calc=%d\r\n"), result, frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.checksum, calculatedChecksum); // 수신 Checksum과 재계산 Checksum을 비교할 수 있는 로그를 만듭니다.
 	AppendEditText(edit, log); // 지정한 출력창에 Checksum 검증 로그를 추가합니다.
 }
@@ -103,6 +115,69 @@ void AppendCorruptPacketLog(CEdit& edit, const Frame& frame) // 고의 손상한
 	CString log; // 화면에 출력할 고의 손상 로그 문자열입니다.
 	log.Format(_T("[CORRUPT PACKET] msg=%d frag=%d/%d payload_byte=0 checksum_kept=%d\r\n"), frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.checksum); // 어떤 Frame을 손상했는지 확인 가능한 로그를 만듭니다.
 	AppendEditText(edit, log); // 지정한 출력창에 고의 손상 로그를 추가합니다.
+}
+
+void ApplyXorCipher(Frame& frame) // Frame의 Payload에 XOR 암호화 또는 복호화를 적용합니다.
+{
+	for (int index = 0; index < frame.payload_len; index++) // 실제 Payload Byte 수만큼만 반복합니다.
+		frame.payload[index] = frame.payload[index] ^ XOR_KEY; // 같은 Key로 XOR하여 암호화와 복호화를 모두 처리합니다.
+}
+
+void AppendXorCipherLog(CEdit& edit, LPCTSTR action, const Frame& frame) // XOR 암호화 또는 복호화 수행 결과를 로그창에 출력합니다.
+{
+	CString log; // 화면에 출력할 XOR 처리 로그 문자열입니다.
+	log.Format(_T("[XOR %s] msg=%d frag=%d/%d key=0x%02X payload_len=%d\r\n"), action, frame.msg_id, frame.frag_index + 1, frame.frag_count, XOR_KEY, frame.payload_len); // 어떤 조각에 XOR 처리를 했는지 로그로 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 XOR 처리 로그를 추가합니다.
+}
+
+Frame MakeAckOnlyFrame(int ackNum) // 정상 수신한 Frame 번호만 담는 Stop-and-Wait ACK 전용 Frame을 만듭니다.
+{
+	Frame ackFrame; // ACK 전용 Frame을 기본값으로 초기화합니다.
+	ackFrame.seq_num = 0; // ACK 전용 Frame은 데이터 순서 번호를 사용하지 않습니다.
+	ackFrame.ack_num = ackNum; // 상대에게 확인해 줄 마지막 정상 수신 Frame 번호를 저장합니다.
+	ackFrame.checksum = CalculateFrameChecksum(ackFrame); // ACK Header 값만 기준으로 Checksum을 계산합니다.
+	return ackFrame; // 완성된 ACK 전용 Frame을 반환합니다.
+}
+
+void QueueAckOnlyFrame(CList<Frame, Frame&>* pList, int ackNum, CEdit& edit) // ACK 전용 Frame을 송신 큐 앞쪽에 넣어 빠르게 전송합니다.
+{
+	if (ackNum <= 0) // 아직 정상 수신한 Frame이 없으면 ACK 전용 Frame을 만들지 않습니다.
+		return;
+
+	Frame ackFrame = MakeAckOnlyFrame(ackNum); // 현재 ACK 번호를 담은 제어 Frame을 생성합니다.
+	tx_cs.Lock(); // 송신 리스트에 ACK Frame을 넣는 동안 접근을 잠급니다.
+	pList->AddHead(ackFrame); // ACK는 데이터보다 우선 전송되도록 송신 리스트 앞에 추가합니다.
+	tx_cs.Unlock(); // 송신 리스트 잠금을 풉니다.
+
+	CString log; // 화면에 출력할 ACK 대기열 로그 문자열입니다.
+	log.Format(_T("[ACK QUEUE] ack=%d checksum=%d\r\n"), ackFrame.ack_num, ackFrame.checksum); // ACK 전용 Frame이 전송 대기열에 들어갔음을 로그로 만듭니다.
+	AppendEditText(edit, log); // 지정한 출력창에 ACK 대기열 로그를 추가합니다.
+}
+
+BOOL TakeAckOnlyFrame(CList<Frame, Frame&>* pList, Frame& frame) // 송신 큐 안에서 ACK 전용 Frame을 찾아 먼저 꺼냅니다.
+{
+	POSITION pos = pList->GetHeadPosition(); // 송신 리스트의 첫 위치부터 검사합니다.
+	while (pos != NULL) // 리스트 끝까지 ACK 전용 Frame을 찾습니다.
+	{
+		POSITION currentPos = pos; // 찾은 위치를 삭제에 사용할 수 있도록 저장합니다.
+		Frame currentFrame = pList->GetNext(pos); // 현재 위치의 Frame 값을 가져옵니다.
+		if (IsAckOnlyFrame(currentFrame)) // ACK 전용 Frame이면 일반 데이터보다 먼저 전송합니다.
+		{
+			frame = currentFrame; // 호출자에게 전송할 ACK Frame을 복사합니다.
+			pList->RemoveAt(currentPos); // 송신 리스트에서 해당 ACK Frame을 제거합니다.
+			return TRUE; // ACK 전용 Frame을 찾았음을 알립니다.
+		}
+	}
+
+	return FALSE; // 송신 큐에 ACK 전용 Frame이 없음을 알립니다.
+}
+
+void RefreshFrameAckAndChecksum(Frame& frame, int lastAckNum) // 송신 직전 최신 ACK 값을 Frame에 반영하고 Checksum을 다시 계산합니다.
+{
+	if (!IsAckOnlyFrame(frame)) // 데이터 Frame만 Piggyback ACK 값을 갱신합니다.
+		frame.ack_num = lastAckNum;
+
+	frame.checksum = CalculateFrameChecksum(frame); // Header가 바뀌었을 수 있으므로 Checksum을 다시 계산합니다.
 }
 
 CString Utf8BytesToText(const BYTE* payload, int payloadLen, int maxBytes) // UTF-8 Byte 배열을 화면 출력용 CString으로 복원합니다.
@@ -229,6 +304,8 @@ void ApplySeqAckToFrames(CList<Frame, Frame&>& frameList, int& nextSeqNum, int l
 		Frame& frame = frameList.GetNext(pos); // 현재 송신할 Frame을 참조로 가져옵니다.
 		frame.seq_num = nextSeqNum; // Frame 하나마다 증가하는 송신 순서 번호를 기록합니다.
 		frame.ack_num = lastAckNum; // 마지막 정상 수신 Frame 번호를 ACK로 함께 실어 보냅니다.
+		ApplyXorCipher(frame); // 송신 Payload를 XOR Key로 암호화합니다.
+		AppendXorCipherLog(edit, _T("ENCRYPT"), frame); // 암호화된 Frame 정보를 로그창에 출력합니다.
 		frame.checksum = CalculateFrameChecksum(frame); // seq/ack가 포함된 Header와 Payload 기준으로 Checksum을 계산합니다.
 
 		CString log; // 화면에 출력할 Piggyback 로그 문자열입니다.
@@ -238,36 +315,67 @@ void ApplySeqAckToFrames(CList<Frame, Frame&>& frameList, int& nextSeqNum, int l
 	}
 }
 
-void ProcessPiggybackAck(CEdit& edit, const Frame& frame, int& lastReceivedAckNum, int lastSentSeqNum) // 상대가 데이터 Frame에 실어 보낸 ACK 번호를 검증합니다.
+BOOL ProcessStopWaitAck(CEdit& edit, int ackNum, int peerSeqNum, BOOL ackOnly, int& lastReceivedAckNum, int lastSentSeqNum, BOOL& waitingAck, Frame& waitFrame, int& waitAckNum, int& retryCount, DWORD& lastSendTick) // 수신한 ACK 번호로 Stop-and-Wait 대기 상태를 갱신합니다.
 {
-	if (frame.ack_num <= 0) // ACK 0은 아직 상대가 정상 수신한 내 Frame이 없다는 뜻입니다.
-		return;
+	if (ackNum <= 0) // ACK 0은 아직 상대가 정상 수신한 내 Frame이 없다는 뜻입니다.
+		return FALSE;
 
-	if (frame.ack_num > lastSentSeqNum) // 내가 아직 보내지 않은 Frame 번호를 ACK하면 비정상 ACK로 판단합니다.
+	CString ackType = ackOnly ? _T("ack_only") : _T("piggyback"); // ACK가 전용 Frame인지 데이터 Frame에 실린 값인지 구분합니다.
+	if (ackNum > lastSentSeqNum) // 내가 아직 보내지 않은 Frame 번호를 ACK하면 비정상 ACK로 판단합니다.
 	{
 		CString ackWarnLog; // 화면에 출력할 ACK 경고 로그 문자열입니다.
-		ackWarnLog.Format(_T("[ACK WARN] ack=%d last_sent=%d reason=future\r\n"), frame.ack_num, lastSentSeqNum); // 미래 ACK 번호를 로그로 만듭니다.
+		ackWarnLog.Format(_T("[ACK WARN] ack=%d last_sent=%d type=%s reason=future\r\n"), ackNum, lastSentSeqNum, ackType.GetString()); // 미래 ACK 번호를 로그로 만듭니다.
 		AppendEditText(edit, ackWarnLog); // 지정한 출력창에 ACK 경고 로그를 추가합니다.
-		return;
+		return FALSE;
 	}
 
-	if (frame.ack_num <= lastReceivedAckNum) // 이미 처리한 ACK와 같거나 더 작으면 중복 ACK로 판단합니다.
+	BOOL isDuplicate = FALSE; // 이미 처리한 ACK인지 저장합니다.
+	BOOL completedWait = FALSE; // 이번 ACK로 Stop-and-Wait 대기가 끝났는지 저장합니다.
+	int completedSeq = 0; // 완료된 송신 Frame 번호를 저장합니다.
+
+	tx_cs.Lock(); // ACK 대기 상태와 송신 상태를 같이 갱신하기 위해 잠급니다.
+	if (ackNum <= lastReceivedAckNum) // 이미 처리한 ACK와 같거나 더 작으면 중복 ACK로 판단합니다.
+		isDuplicate = TRUE;
+	else // 새 ACK이면 마지막 수신 ACK 번호를 갱신합니다.
+		lastReceivedAckNum = ackNum;
+
+	if (!isDuplicate && waitingAck && ackNum >= waitAckNum) // 기다리던 Frame 번호 이상을 ACK 받으면 전송 완료로 처리합니다.
+	{
+		completedSeq = waitAckNum; // 로그에 남길 완료 Frame 번호를 저장합니다.
+		waitingAck = FALSE; // 다음 데이터 Frame을 보낼 수 있도록 ACK 대기를 해제합니다.
+		waitFrame = Frame(); // 더 이상 재전송할 Frame이 없도록 대기 Frame을 비웁니다.
+		waitAckNum = 0; // 기다리는 ACK 번호를 초기화합니다.
+		retryCount = 0; // 재전송 횟수를 초기화합니다.
+		lastSendTick = 0; // Timeout 기준 시간을 초기화합니다.
+		completedWait = TRUE; // Stop-and-Wait 완료 로그를 남기도록 표시합니다.
+	}
+	tx_cs.Unlock(); // ACK 대기 상태 갱신을 마치고 잠금을 풉니다.
+
+	if (isDuplicate) // 이미 처리한 ACK이면 중복 로그만 남깁니다.
 	{
 		CString ackDupLog; // 화면에 출력할 중복 ACK 로그 문자열입니다.
-		ackDupLog.Format(_T("[ACK DUP] ack=%d last_ack=%d\r\n"), frame.ack_num, lastReceivedAckNum); // 중복 ACK 정보를 로그로 만듭니다.
+		ackDupLog.Format(_T("[ACK DUP] ack=%d last_ack=%d type=%s\r\n"), ackNum, lastReceivedAckNum, ackType.GetString()); // 중복 ACK 정보를 로그로 만듭니다.
 		AppendEditText(edit, ackDupLog); // 지정한 출력창에 중복 ACK 로그를 추가합니다.
-		return;
+		return FALSE;
 	}
 
-	lastReceivedAckNum = frame.ack_num; // 새로 확인된 ACK 번호를 저장합니다.
 	CString ackReceiveLog; // 화면에 출력할 ACK 수신 로그 문자열입니다.
-	ackReceiveLog.Format(_T("[ACK RECV] ack=%d piggyback_seq=%d\r\n"), frame.ack_num, frame.seq_num); // 상대가 마지막으로 정상 수신한 내 Frame 번호를 로그로 만듭니다.
+	ackReceiveLog.Format(_T("[ACK RECV] ack=%d type=%s peer_seq=%d\r\n"), ackNum, ackType.GetString(), peerSeqNum); // 상대가 마지막으로 정상 수신한 내 Frame 번호를 로그로 만듭니다.
 	AppendEditText(edit, ackReceiveLog); // 지정한 출력창에 ACK 수신 로그를 추가합니다.
+
+	if (completedWait) // 기다리던 ACK를 받아 Stop-and-Wait 대기가 끝났으면 완료 로그를 남깁니다.
+	{
+		CString doneLog; // 화면에 출력할 Stop-and-Wait 완료 로그 문자열입니다.
+		doneLog.Format(_T("[SW DONE] seq=%d ack=%d\r\n"), completedSeq, ackNum); // 어떤 송신 Frame이 ACK로 완료되었는지 로그로 만듭니다.
+		AppendEditText(edit, doneLog); // 지정한 출력창에 Stop-and-Wait 완료 로그를 추가합니다.
+	}
+
+	return TRUE; // 새 ACK를 정상 처리했음을 알립니다.
 }
 
-BOOL ProcessSeqAck(CEdit& edit, const Frame& frame, int& expectedSeqNum, int& lastAckNum, int& lastReceivedAckNum, int lastSentSeqNum) // Checksum을 통과한 Frame의 seq/ack 정보를 검증하고 ACK 상태를 갱신합니다.
+BOOL ProcessSeqAck(CEdit& edit, const Frame& frame, int& expectedSeqNum, int& lastAckNum, int& lastReceivedAckNum, int lastSentSeqNum, BOOL& waitingAck, Frame& waitFrame, int& waitAckNum, int& retryCount, DWORD& lastSendTick) // Checksum을 통과한 Frame의 seq/ack 정보를 검증하고 ACK 상태를 갱신합니다.
 {
-	ProcessPiggybackAck(edit, frame, lastReceivedAckNum, lastSentSeqNum); // 데이터 Frame에 같이 실려 온 ACK 번호를 먼저 검증합니다.
+	ProcessStopWaitAck(edit, frame.ack_num, frame.seq_num, FALSE, lastReceivedAckNum, lastSentSeqNum, waitingAck, waitFrame, waitAckNum, retryCount, lastSendTick); // 데이터 Frame에 같이 실려 온 ACK 번호를 먼저 검증합니다.
 
 	if (frame.seq_num == expectedSeqNum) // 기대한 순서 번호의 Frame인지 확인합니다.
 	{
@@ -308,6 +416,14 @@ CString FramePayloadToText(const Frame& frame) // 수신한 Frame Payload를 화
 
 void AppendPacketLog(CEdit& edit, LPCTSTR action, const Frame& frame, int packetBytes) // Frame 송수신 결과를 검증 가능한 로그로 출력합니다.
 {
+	if (IsAckOnlyFrame(frame)) // ACK 전용 Frame이면 Payload와 조각 정보 없이 ACK 중심으로 출력합니다.
+	{
+		CString ackLog; // 화면에 출력할 ACK 전용 패킷 로그 문자열입니다.
+		ackLog.Format(_T("[%s ACK] packet_bytes=%d ack=%d checksum=%d\r\n"), action, packetBytes, frame.ack_num, frame.checksum); // ACK 전용 Frame의 핵심 Header만 로그로 만듭니다.
+		AppendEditText(edit, ackLog); // 지정한 출력창에 ACK 전용 패킷 로그를 추가합니다.
+		return;
+	}
+
 	CString payloadText = FramePayloadToText(frame); // 로그에 보여줄 Payload 문자열을 복원합니다.
 	CString log; // 화면에 출력할 패킷 로그 문자열입니다.
 	log.Format(_T("[%s PACKET] packet_bytes=%d seq=%d ack=%d checksum=%d msg=%d frag=%d/%d payload_len=%d payload=\"%s\"\r\n"), action, packetBytes, frame.seq_num, frame.ack_num, frame.checksum, frame.msg_id, frame.frag_index + 1, frame.frag_count, frame.payload_len, payloadText.GetString()); // Header 값과 세그먼트 정보를 포함한 로그를 만듭니다.
@@ -474,17 +590,83 @@ UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하�
 	{
 		Frame frame; // 송신 리스트에서 꺼낸 Frame 패킷을 저장합니다.
 		BOOL hasFrame = FALSE; // 이번 반복에서 송신할 Frame이 있는지 표시합니다.
+		BOOL isAckOnly = FALSE; // 이번 송신 Frame이 ACK 전용 제어 Frame인지 표시합니다.
+		BOOL isRetransmission = FALSE; // 이번 송신이 Timeout으로 인한 재전송인지 표시합니다.
+		int currentRetryCount = 0; // 재전송 로그에 표시할 현재 재시도 횟수입니다.
+		CString stateLog; // 송신 상태 변화 로그를 잠금 밖에서 출력하기 위해 저장합니다.
 
 		tx_cs.Lock(); // 송신 리스트 접근을 잠급니다.
-		if (!plist->IsEmpty()) // 송신할 Frame이 있으면 하나 꺼냅니다.
+		if (TakeAckOnlyFrame(plist, frame)) // ACK 전용 Frame은 Stop-and-Wait 대기 중이어도 우선 전송합니다.
+		{
+			RefreshFrameAckAndChecksum(frame, pDlg->m_lastAckNum); // 송신 직전 Checksum을 다시 계산합니다.
+			hasFrame = TRUE; // 송신할 ACK 전용 Frame이 있음을 표시합니다.
+			isAckOnly = TRUE; // 이번 Frame이 ACK 전용임을 표시합니다.
+		}
+		else if (pDlg->m_waitingAck) // 데이터 Frame을 보낸 뒤 ACK를 기다리는 중이면 Timeout을 확인합니다.
+		{
+			DWORD nowTick = GetTickCount(); // 현재 시간을 가져와 마지막 송신 시각과 비교합니다.
+			if (nowTick - pDlg->m_lastSendTick >= STOP_WAIT_TIMEOUT_MS) // ACK 대기 시간이 Timeout 기준을 넘었는지 확인합니다.
+			{
+				if (pDlg->m_retryCount < STOP_WAIT_MAX_RETRY) // 최대 재전송 횟수 전이면 같은 Frame을 다시 보냅니다.
+				{
+					pDlg->m_retryCount++; // 현재 Frame의 재전송 횟수를 증가시킵니다.
+					pDlg->m_lastSendTick = nowTick; // 이번 재전송 시각을 Timeout 기준으로 갱신합니다.
+					frame = pDlg->m_waitFrame; // ACK를 기다리던 Frame을 재전송 대상으로 복사합니다.
+					RefreshFrameAckAndChecksum(frame, pDlg->m_lastAckNum); // 재전송 직전 최신 Piggyback ACK와 Checksum을 반영합니다.
+					pDlg->m_waitFrame = frame; // 다음 재전송도 같은 Header 기준으로 이루어지도록 대기 Frame을 갱신합니다.
+					hasFrame = TRUE; // 재전송할 Frame이 있음을 표시합니다.
+					isRetransmission = TRUE; // 이번 송신이 재전송임을 표시합니다.
+					currentRetryCount = pDlg->m_retryCount; // 로그에 표시할 재전송 횟수를 저장합니다.
+				}
+				else // 최대 재전송 횟수를 넘으면 현재 Frame 전송 실패로 처리합니다.
+				{
+					int failedSeq = pDlg->m_waitAckNum; // 실패 로그에 표시할 송신 Frame 번호를 저장합니다.
+					pDlg->m_waitingAck = FALSE; // 다음 Frame 처리가 가능하도록 ACK 대기를 해제합니다.
+					pDlg->m_waitFrame = Frame(); // 더 이상 재전송할 Frame이 없도록 대기 Frame을 비웁니다.
+					pDlg->m_waitAckNum = 0; // 기다리는 ACK 번호를 초기화합니다.
+					pDlg->m_retryCount = 0; // 재전송 횟수를 초기화합니다.
+					pDlg->m_lastSendTick = 0; // 마지막 송신 시각을 초기화합니다.
+					stateLog.Format(_T("[SW FAIL] seq=%d retry=%d/%d\r\n"), failedSeq, STOP_WAIT_MAX_RETRY, STOP_WAIT_MAX_RETRY); // 재전송 실패 상태를 로그로 만듭니다.
+				}
+			}
+		}
+		else if (!plist->IsEmpty()) // ACK 대기 중이 아니고 송신할 데이터 Frame이 있으면 하나 꺼냅니다.
 		{
 			frame = plist->RemoveHead(); // 송신할 Frame을 리스트에서 제거하며 가져옵니다.
+			RefreshFrameAckAndChecksum(frame, pDlg->m_lastAckNum); // 송신 직전 최신 Piggyback ACK와 Checksum을 반영합니다.
+			pDlg->m_waitingAck = TRUE; // Stop-and-Wait 규칙에 따라 ACK를 기다리는 상태로 전환합니다.
+			pDlg->m_waitFrame = frame; // Timeout이 나면 다시 보낼 수 있도록 현재 Frame을 저장합니다.
+			pDlg->m_waitAckNum = frame.seq_num; // 현재 Frame 번호를 기다리는 ACK 번호로 저장합니다.
+			pDlg->m_retryCount = 0; // 새 Frame의 재전송 횟수를 0으로 초기화합니다.
+			pDlg->m_lastSendTick = GetTickCount(); // 새 Frame의 최초 송신 시각을 저장합니다.
 			hasFrame = TRUE; // 송신할 Frame이 있음을 표시합니다.
 		}
 		tx_cs.Unlock(); // 송신 리스트 잠금을 풉니다.
 
+		if (!stateLog.IsEmpty()) // 잠금 안에서 만든 상태 로그가 있으면 화면에 출력합니다.
+			AppendEditText(pDlg->m_packet_log_edit, stateLog);
+
 		if (hasFrame) // 송신할 Frame이 있을 때만 UDP 전송을 시도합니다.
 		{
+			if (isAckOnly) // ACK 전용 Frame을 보내는 경우 제어 Frame 로그를 남깁니다.
+			{
+				CString ackSendLog; // 화면에 출력할 ACK 송신 로그 문자열입니다.
+				ackSendLog.Format(_T("[ACK SEND] ack=%d\r\n"), frame.ack_num); // ACK 전용 Frame 송신 정보를 로그로 만듭니다.
+				AppendEditText(pDlg->m_packet_log_edit, ackSendLog); // 지정한 출력창에 ACK 송신 로그를 추가합니다.
+			}
+			else if (isRetransmission) // Timeout이 발생해 같은 데이터 Frame을 다시 보내는 경우 로그를 남깁니다.
+			{
+				CString retryLog; // 화면에 출력할 재전송 로그 문자열입니다.
+				retryLog.Format(_T("[TIMEOUT] seq=%d retry=%d/%d\r\n[RETX] seq=%d ack=%d\r\n"), frame.seq_num, currentRetryCount, STOP_WAIT_MAX_RETRY, frame.seq_num, frame.ack_num); // Timeout과 재전송 정보를 함께 로그로 만듭니다.
+				AppendEditText(pDlg->m_packet_log_edit, retryLog); // 지정한 출력창에 재전송 로그를 추가합니다.
+			}
+			else // 처음 보내는 데이터 Frame이면 ACK 대기 시작 로그를 남깁니다.
+			{
+				CString waitLog; // 화면에 출력할 Stop-and-Wait 송신 로그 문자열입니다.
+				waitLog.Format(_T("[SW SEND] seq=%d ack=%d\r\n[SW WAIT] seq=%d timeout=%dms\r\n"), frame.seq_num, frame.ack_num, frame.seq_num, STOP_WAIT_TIMEOUT_MS); // 데이터 Frame 송신과 ACK 대기 상태를 로그로 만듭니다.
+				AppendEditText(pDlg->m_packet_log_edit, waitLog); // 지정한 출력창에 Stop-and-Wait 송신 로그를 추가합니다.
+			}
+
 			if (pDlg->m_hSocket != INVALID_SOCKET) // UDP 소켓이 있을 때만 전송합니다.
 			{
 				BYTE nField0, nField1, nField2, nField3; // IP Address 컨트롤의 각 주소 값을 저장합니다.
@@ -496,7 +678,7 @@ UINT TXThread(LPVOID arg) // 송신 리스트의 메시지를 UDP로 전송하�
 				server_addr.sin_family = AF_INET; // IPv4 주소 체계를 사용합니다.
 				server_addr.sin_port = htons(8000); // 서버 포트 번호를 8000번으로 설정합니다.
 				InetPton(AF_INET, addr, &server_addr.sin_addr); // 서버 IP 주소를 저장합니다.
-				if (pDlg->m_corruptNextPacket) // Checksum 시연 예약이 있으면 이번 송신 Frame 하나를 손상합니다.
+				if (!isAckOnly && pDlg->m_corruptNextPacket) // Checksum 시연 예약이 있으면 데이터 Frame 하나만 손상합니다.
 				{
 					pDlg->m_corruptNextPacket = FALSE; // 한 번만 손상되도록 예약 플래그를 즉시 끕니다.
 					if (CorruptFrameForChecksumDemo(frame)) // Checksum은 유지하고 Payload만 일부 변경합니다.
@@ -607,6 +789,11 @@ CUDPClientThdDlg::CUDPClientThdDlg(CWnd* pParent /*=nullptr*/)
 	m_expectedSeqNum = 1; // 처음 받을 상대 Frame 순서 번호를 1로 기대합니다.
 	m_lastAckNum = 0; // 아직 정상 수신한 상대 Frame이 없음을 ACK 0으로 표시합니다.
 	m_lastReceivedAckNum = 0; // 아직 상대가 확인해 준 내 Frame이 없음을 표시합니다.
+	m_waitingAck = FALSE; // 시작 시점에는 ACK를 기다리는 송신 Frame이 없음을 표시합니다.
+	m_waitFrame = Frame(); // 시작 시점의 재전송 대기 Frame을 빈 값으로 초기화합니다.
+	m_waitAckNum = 0; // 시작 시점에는 기다리는 ACK 번호가 없음을 표시합니다.
+	m_retryCount = 0; // 시작 시점의 재전송 횟수를 0으로 초기화합니다.
+	m_lastSendTick = 0; // 시작 시점에는 마지막 송신 시각이 없음을 표시합니다.
 	m_corruptNextPacket = FALSE; // 기본 상태에서는 송신 Frame을 손상하지 않도록 초기화합니다.
 }
 
@@ -760,13 +947,14 @@ void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스
 		return;
 	}
 
-	if (frame.payload_len <= 0 || frame.payload_len > FRAME_PAYLOAD_SIZE) // Payload 길이가 범위를 벗어나면 버립니다.
+	BOOL ackOnlyFrame = IsAckOnlyFrame(frame); // 수신 Frame이 ACK 전용 제어 Frame인지 먼저 구분합니다.
+	if (!ackOnlyFrame && (frame.payload_len <= 0 || frame.payload_len > FRAME_PAYLOAD_SIZE)) // 데이터 Frame의 Payload 길이가 범위를 벗어나면 버립니다.
 	{
 		AppendEditText(m_packet_log_edit, _T("[RECV DROP] invalid payload length\r\n")); // 잘못된 Payload 길이를 로그에 남깁니다.
 		return;
 	}
 
-	if (!IsValidSegmentHeader(frame)) // 메시지 번호와 조각 번호가 정상 범위인지 확인합니다.
+	if (!ackOnlyFrame && !IsValidSegmentHeader(frame)) // 데이터 Frame의 메시지 번호와 조각 번호가 정상 범위인지 확인합니다.
 	{
 		AppendEditText(m_packet_log_edit, _T("[RECV DROP] invalid segment header\r\n")); // 잘못된 세그먼트 Header를 로그에 남깁니다.
 		return;
@@ -781,8 +969,23 @@ void CUDPClientThdDlg::ProcessReceive() // UDP 메시지를 받아 수신 리스
 
 	AppendChecksumLog(m_packet_log_edit, _T("OK"), frame, calculatedChecksum); // Checksum 검증 성공 정보를 패킷 로그에 남깁니다.
 
-	if (!ProcessSeqAck(m_packet_log_edit, frame, m_expectedSeqNum, m_lastAckNum, m_lastReceivedAckNum, m_nextSeqNum - 1)) // Checksum을 통과한 Frame의 순서 번호와 ACK 정보를 검증합니다.
+	if (ackOnlyFrame) // ACK 전용 Frame이면 재조립하지 않고 Stop-and-Wait 대기 상태만 갱신합니다.
+	{
+		AppendPacketLog(m_packet_log_edit, _T("RECV"), frame, nbytes); // ACK 전용 Frame 수신 정보를 로그창에 바로 출력합니다.
+		ProcessStopWaitAck(m_packet_log_edit, frame.ack_num, frame.seq_num, TRUE, m_lastReceivedAckNum, m_nextSeqNum - 1, m_waitingAck, m_waitFrame, m_waitAckNum, m_retryCount, m_lastSendTick); // ACK 번호로 송신 대기 상태를 갱신합니다.
 		return;
+	}
+
+	ApplyXorCipher(frame); // Checksum 검증이 끝난 정상 데이터 Frame의 Payload를 원문으로 복호화합니다.
+	AppendXorCipherLog(m_packet_log_edit, _T("DECRYPT"), frame); // 복호화된 Frame 정보를 로그창에 출력합니다.
+
+	if (!ProcessSeqAck(m_packet_log_edit, frame, m_expectedSeqNum, m_lastAckNum, m_lastReceivedAckNum, m_nextSeqNum - 1, m_waitingAck, m_waitFrame, m_waitAckNum, m_retryCount, m_lastSendTick)) // Checksum을 통과한 Frame의 순서 번호와 ACK 정보를 검증합니다.
+	{
+		QueueAckOnlyFrame(arg1.pList, m_lastAckNum, m_packet_log_edit); // 중복 또는 순서 오류 Frame에는 마지막 정상 수신 번호를 다시 ACK합니다.
+		return;
+	}
+
+	QueueAckOnlyFrame(arg1.pList, m_lastAckNum, m_packet_log_edit); // 정상 수신한 데이터 Frame 번호를 ACK 전용 Frame으로 즉시 돌려줍니다.
 
 	rx_cs.Lock(); // 수신 리스트 접근을 잠급니다.
 	arg2.pList->AddTail(frame); // 받은 Frame 패킷을 수신 리스트에 추가합니다.
