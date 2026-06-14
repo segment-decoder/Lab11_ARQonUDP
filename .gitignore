@@ -22,3 +22,6 @@ Release/
 *.res
 *.log
 *.exe
+*.ppt
+*.pptx
+*.md
